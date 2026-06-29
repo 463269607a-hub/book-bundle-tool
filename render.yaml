@@ -1,0 +1,10 @@
+# Render 部署蓝图（Blueprint）
+# 在 Render 上点 New → Blueprint，选中本仓库即可自动按此配置部署
+services:
+  - type: web
+    name: book-bundle-tool
+    runtime: python
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true

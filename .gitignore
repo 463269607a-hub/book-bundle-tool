@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Node
+frontend/node_modules/
+
+# 注意：不要忽略 frontend/dist —— Render 用 Python 环境，需要打包好的前端文件
+# （所以这里故意不写 dist）
+
+# 临时/系统文件
+.DS_Store
+Thumbs.db
+*.log
+scratchpad/
+
+# Claude Code 本地配置
+.claude/
