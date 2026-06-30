@@ -167,14 +167,6 @@ export default function App() {
           >
             开始生成
           </button>
-          <label className="debug-label">
-            <input
-              type="checkbox"
-              checked={debugMode}
-              onChange={e => setDebugMode(e.target.checked)}
-            />
-            Debug 模式（显示外接框）
-          </label>
         </div>
         <GenerateProgress generating={generating} progress={generateProgress} />
       </div>
