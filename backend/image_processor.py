@@ -53,17 +53,25 @@ def composite_books(book_images: list, n_books: int, debug: bool = False) -> Ima
     draw = ImageDraw.Draw(canvas)
 
     for slot, book in zip(sorted(template, key=lambda s: s['z']), book_images):
-        target_h = int(slot['scale_h'] * 800)
-        max_w = slot['max_w']
         bw, bh = book.size
-        if bh == 0:
+        if bh == 0 or bw == 0:
             continue
-        # 先按高度缩放；若太宽（正方形/横开本）改按宽度缩放，不霸占整行
-        new_h = target_h
-        new_w = int(bw * new_h / bh)
-        if new_w > max_w:
-            new_w = max_w
+        if 'scale_w' in slot:
+            # 按宽度统一（同排/上下同宽用）；高度随比例，超 max_h 再回退按高度
+            new_w = int(slot['scale_w'] * 800)
             new_h = int(bh * new_w / bw)
+            max_h = slot.get('max_h', 800)
+            if new_h > max_h:
+                new_h = max_h
+                new_w = int(bw * new_h / bh)
+        else:
+            # 按高度统一；太宽（正方形/横开本）回退按宽度，不霸占整行
+            new_h = int(slot['scale_h'] * 800)
+            new_w = int(bw * new_h / bh)
+            max_w = slot['max_w']
+            if new_w > max_w:
+                new_w = max_w
+                new_h = int(bh * new_w / bw)
 
         resized = book.resize((new_w, new_h), Image.LANCZOS).convert('RGB')
         cx = slot['cx']
