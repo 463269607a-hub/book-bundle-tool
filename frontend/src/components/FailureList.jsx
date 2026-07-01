@@ -2,12 +2,11 @@ export default function FailureList({ failed }) {
   if (!failed || failed.length === 0) return null
 
   function exportCSV() {
-    const header = 'group_id,output_name,失败原因\n'
+    const header = '组套名称,失败原因\n'
     const rows = failed.map(item => {
-      const gid = (item.row?.group_id || '').toString().replace(/"/g, '""')
       const oname = (item.row?.output_name || '').toString().replace(/"/g, '""')
       const reason = (item.reason || '').replace(/"/g, '""')
-      return `"${gid}","${oname}","${reason}"`
+      return `"${oname}","${reason}"`
     }).join('\n')
     const csv = '﻿' + header + rows  // BOM for Excel
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
@@ -30,15 +29,13 @@ export default function FailureList({ failed }) {
       <table>
         <thead>
           <tr>
-            <th>group_id</th>
-            <th>output_name</th>
+            <th>组套名称</th>
             <th>失败原因</th>
           </tr>
         </thead>
         <tbody>
           {failed.map((item, i) => (
             <tr key={i}>
-              <td>{item.row?.group_id || '-'}</td>
               <td>{item.row?.output_name || '-'}</td>
               <td className="reason-cell">{item.reason}</td>
             </tr>

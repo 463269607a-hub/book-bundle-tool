@@ -33,16 +33,14 @@ def parse_table(file_bytes: bytes, filename: str) -> list:
                 val = val[:-2]
             return val if val else None
 
-        group_id = get_val('group_id')
-        output_name = get_val('output_name')
-        code_1 = get_val('code_1')
-        code_2 = get_val('code_2')
-        code_3 = get_val('code_3')
-        code_4 = get_val('code_4')
-        code_5 = get_val('code_5')
+        output_name = get_val('组套名称')
+        code_1 = get_val('子品1')
+        code_2 = get_val('子品2')
+        code_3 = get_val('子品3')
+        code_4 = get_val('子品4')
+        code_5 = get_val('子品5')
 
         rows.append({
-            'group_id': group_id,
             'output_name': output_name,
             'code_1': code_1,
             'code_2': code_2,

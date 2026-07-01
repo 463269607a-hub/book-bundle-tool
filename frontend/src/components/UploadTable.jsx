@@ -42,12 +42,12 @@ export default function UploadTable({ sessionId, onUploaded }) {
 
   function downloadTemplate() {
     const bom = '﻿'
-    const header = 'group_id,output_name,code_1,code_2,code_3,code_4,code_5'
+    const header = '组套名称,子品1,子品2,子品3,子品4,子品5'
     const rows = [
-      'set001,二本套装示例,29412867,29412868,,,',
-      'set002,三本套装示例,29412867,29412868,29412869,,',
-      'set003,四本套装示例,29412867,29412868,29412869,29412870,',
-      'set004,五本套装示例,29412867,29412868,29412869,29412870,29412871',
+      '二本套装示例,29412867,29412868,,,',
+      '三本套装示例,29412867,29412868,29412869,,',
+      '四本套装示例,29412867,29412868,29412869,29412870,',
+      '五本套装示例,29412867,29412868,29412869,29412870,29412871',
     ]
     const csv = bom + [header, ...rows].join('\n')
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
@@ -85,7 +85,7 @@ export default function UploadTable({ sessionId, onUploaded }) {
       <div className="upload-icon">📋</div>
       <div className="upload-label">上传匹配表格</div>
       <div className="upload-hint">拖拽或点击选择 CSV / Excel 文件</div>
-      <div className="upload-hint" style={{ marginTop: 4 }}>列名：group_id, output_name, code_1 ~ code_5</div>
+      <div className="upload-hint" style={{ marginTop: 4 }}>列名：组套名称, 子品1 ~ 子品5</div>
       {uploading && <div className="upload-count" style={{ background: '#fff3cd', color: '#856404' }}>上传中...</div>}
       {!uploading && count > 0 && (
         <div className="upload-count">{filename} — 共 {count} 行</div>

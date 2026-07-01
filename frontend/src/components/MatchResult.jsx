@@ -14,15 +14,13 @@ export default function MatchResult({ validationResult }) {
         <table>
           <thead>
             <tr>
-              <th>group_id</th>
-              <th>output_name</th>
+              <th>组套名称</th>
               <th>失败原因</th>
             </tr>
           </thead>
           <tbody>
             {failed.map((item, i) => (
               <tr key={i}>
-                <td>{item.row?.group_id || '-'}</td>
                 <td>{item.row?.output_name || '-'}</td>
                 <td className="reason-cell">{item.reason}</td>
               </tr>
