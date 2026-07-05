@@ -124,8 +124,8 @@ def _fit_quad_mask(content: np.ndarray, h: int, w: int):
     return mask
 
 
-def _span_mask(content: np.ndarray, h: int, w: int) -> Image.Image:
-    """回退方案：行/列跨度填充取交集（贴合任意凸形轮廓）。"""
+def _span_bool(content: np.ndarray, h: int, w: int) -> np.ndarray:
+    """行/列跨度填充取交集（贴合任意凸形轮廓），返回 bool 数组。"""
     cols = np.arange(w)
     rows_any = content.any(axis=1)
     first_c = content.argmax(axis=1)
@@ -138,9 +138,7 @@ def _span_mask(content: np.ndarray, h: int, w: int) -> Image.Image:
     last_r = h - 1 - content[::-1, :].argmax(axis=0)
     col_span = cols_any[None, :] & (rows >= first_r[None, :]) & (rows <= last_r[None, :])
 
-    mask = Image.fromarray(((row_span & col_span).astype(np.uint8)) * 255)
-    # 往里收 1px，吃掉轮廓边缘最后一圈发白的过渡像素
-    return mask.filter(ImageFilter.MinFilter(3))
+    return row_span & col_span
 
 
 def build_book_mask(img: Image.Image) -> Image.Image:
@@ -150,7 +148,10 @@ def build_book_mask(img: Image.Image) -> Image.Image:
     把边缘的白色过渡像素（抗锯齿圈、浅色书页边、照明渐变）全部切掉——
     贴出来的边缘直接落在封面色块内，干净利落，无需描边遮丑。
     封面内部的白色区域必然在四边形内部，永远实心不穿帮。
-    轮廓不像四边形时（拟合残差大），回退到行/列跨度填充法。
+    但书侧面（书脊/切口）透视下轮廓是"切了角的四边形"，纯直线在角部会
+    越过实际边缘把白底圈进来 —— 所以四边形要再与跨度轮廓取交集：
+    直边处内收后的四边形赢（切掉白色过渡），角部跨度轮廓赢（不越界）。
+    轮廓不像四边形时（拟合残差大），退化为纯跨度填充。
     """
     content = _content_mask(img)
 
@@ -160,24 +161,31 @@ def build_book_mask(img: Image.Image) -> Image.Image:
     content = np.array(m) > 0
     h, w = content.shape
 
+    final = _span_bool(content, h, w)
     quad = _fit_quad_mask(content, h, w)
     if quad is not None:
-        return Image.fromarray((quad.astype(np.uint8)) * 255)
-    return _span_mask(content, h, w)
+        final = final & quad
+
+    mask = Image.fromarray((final.astype(np.uint8)) * 255)
+    # 再往里收 1px，吃掉跨度轮廓段边缘最后一圈过渡像素
+    return mask.filter(ImageFilter.MinFilter(3))
 
 
 def draw_book_shadow(canvas: Image.Image, mask_r: Image.Image, px: int, py: int):
-    """沿书的轮廓在其后方投一圈柔影（drop shadow）：
-    叠压时前书边缘与后书之间有明暗分隔，一眼分得清哪本是哪本；
-    书底下的部分同时起接触投影作用，让书"立"在画面上。"""
-    pad = 24          # 给模糊留的外扩空间
-    blur = 10
-    off_x, off_y = 0, 0   # 四周均匀：4/5本最需要分隔的是前书"顶边"，影子不能往下偏
+    """沿书的轮廓在其后方投双层影（四周均匀，不偏移）：
+      - 宽柔影：大范围淡影，给画面层次
+      - 缝隙线：紧贴边缘的深色窄影，像真实叠书的夹缝阴影，
+        深色封面压深色封面时也能看出边界（分隔主要靠它）
+    书底下的部分同时起接触投影作用。"""
+    pad = 30          # 给模糊留的外扩空间
     big = Image.new('L', (mask_r.width + pad * 2, mask_r.height + pad * 2), 0)
     big.paste(mask_r, (pad, pad))
-    big = big.filter(ImageFilter.GaussianBlur(blur)).point(lambda a: int(a * 0.55))
-    dark = Image.new('RGB', big.size, (70, 70, 70))
-    canvas.paste(dark, (px - pad + off_x, py - pad + off_y), big)
+
+    soft = big.filter(ImageFilter.GaussianBlur(12)).point(lambda a: int(a * 0.35))
+    canvas.paste(Image.new('RGB', soft.size, (60, 60, 60)), (px - pad, py - pad), soft)
+
+    tight = big.filter(ImageFilter.GaussianBlur(3)).point(lambda a: int(a * 0.55))
+    canvas.paste(Image.new('RGB', tight.size, (35, 35, 35)), (px - pad, py - pad), tight)
 
 
 def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Image:
