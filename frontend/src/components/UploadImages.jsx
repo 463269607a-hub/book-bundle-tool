@@ -1,9 +1,10 @@
 import { useRef, useState } from 'react'
 
-export default function UploadImages({ sessionId, onUploaded }) {
+export default function UploadImages({ sessionId, onUploaded, onSessionExpired }) {
   const [dragOver, setDragOver] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [count, setCount] = useState(0)
+  const [skipped, setSkipped] = useState([])
   const inputRef = useRef()
 
   async function handleFiles(files) {
@@ -16,8 +17,10 @@ export default function UploadImages({ sessionId, onUploaded }) {
     }
     try {
       const res = await fetch('/api/upload/images', { method: 'POST', body: fd })
+      if (res.status === 404) { onSessionExpired?.(); return }
       const data = await res.json()
       setCount(data.count)
+      setSkipped(data.skipped || [])
       onUploaded(data.count)
     } catch (e) {
       alert('上传图片失败：' + e.message)
@@ -59,6 +62,18 @@ export default function UploadImages({ sessionId, onUploaded }) {
       {uploading && <div className="upload-count" style={{ background: '#fff3cd', color: '#856404' }}>上传中...</div>}
       {!uploading && count > 0 && (
         <div className="upload-count">已上传 {count} 张图片</div>
+      )}
+      {!uploading && skipped.length > 0 && (
+        <div
+          style={{ marginTop: 8, padding: '6px 10px', background: '#fff3cd', color: '#856404',
+                   borderRadius: 6, fontSize: 12, textAlign: 'left', maxHeight: 120, overflowY: 'auto' }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div style={{ fontWeight: 600 }}>⚠ {skipped.length} 个文件被跳过：</div>
+          {skipped.map((s, i) => (
+            <div key={i}>{s.filename} —— {s.reason}</div>
+          ))}
+        </div>
       )}
     </div>
   )

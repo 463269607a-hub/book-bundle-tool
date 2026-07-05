@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 
-export default function UploadTable({ sessionId, onUploaded }) {
+export default function UploadTable({ sessionId, onUploaded, onSessionExpired }) {
   const [dragOver, setDragOver] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [count, setCount] = useState(0)
@@ -16,6 +16,7 @@ export default function UploadTable({ sessionId, onUploaded }) {
     fd.append('file', file)
     try {
       const res = await fetch('/api/upload/table', { method: 'POST', body: fd })
+      if (res.status === 404) { onSessionExpired?.(); return }
       const data = await res.json()
       if (!res.ok) {
         alert('上传表格失败：' + (data.detail || JSON.stringify(data)))

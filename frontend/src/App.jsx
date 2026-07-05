@@ -29,6 +29,18 @@ export default function App() {
   // Create session on mount
   useEffect(() => { createSession() }, [])
 
+  // 会话在服务器端丢失（如服务重启）：重置页面状态并自动重建会话
+  function handleSessionExpired() {
+    alert('会话已过期（服务器可能重启过），已自动新建会话，请重新上传图片和表格')
+    setSessionId(null)
+    setImageCount(0)
+    setTableRows([])
+    setValidationResult(null)
+    setResults([])
+    setAllFailed([])
+    createSession()
+  }
+
   function handleImagesUploaded(count) {
     setImageCount(count)
     // Reset validation when images change
@@ -53,6 +65,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId }),
       })
+      if (res.status === 404) { handleSessionExpired(); return }
       const data = await res.json()
       setValidationResult(data)
       setResults([])
@@ -72,6 +85,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId, debug: debugMode }),
       })
+      if (res.status === 404) { handleSessionExpired(); return }
       const data = await res.json()
       setResults(data.results || [])
       setAllFailed(data.failed || [])
@@ -91,6 +105,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId }),
       })
+      if (res.status === 404) { handleSessionExpired(); return }
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -119,8 +134,8 @@ export default function App() {
         <div className="card-title">第一步：上传文件</div>
         {sessionId ? (
           <div className="upload-row">
-            <UploadImages sessionId={sessionId} onUploaded={handleImagesUploaded} />
-            <UploadTable sessionId={sessionId} onUploaded={handleTableUploaded} />
+            <UploadImages sessionId={sessionId} onUploaded={handleImagesUploaded} onSessionExpired={handleSessionExpired} />
+            <UploadTable sessionId={sessionId} onUploaded={handleTableUploaded} onSessionExpired={handleSessionExpired} />
           </div>
         ) : (
           sessionError ? (

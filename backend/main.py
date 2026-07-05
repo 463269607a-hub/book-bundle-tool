@@ -2,7 +2,9 @@ import base64
 import io
 import os
 import re
+import shutil
 import tempfile
+import time
 import uuid
 import zipfile
 from typing import Optional
@@ -29,15 +31,28 @@ app.add_middleware(
 # In-memory session store
 sessions: dict = {}
 
+SESSION_TTL = 6 * 3600  # 超过 6 小时的旧会话在新会话创建时清理
+
 
 def get_session(session_id: str) -> dict:
     if session_id not in sessions:
-        raise ValueError(f"Session not found: {session_id}")
+        # 404 让前端能识别"会话已过期"（如服务器重启后内存丢失），自动重建会话
+        raise HTTPException(status_code=404, detail="会话不存在或已过期，请刷新页面重新上传")
     return sessions[session_id]
+
+
+def cleanup_old_sessions():
+    now = time.time()
+    for sid in list(sessions.keys()):
+        s = sessions.get(sid)
+        if s and now - s.get("created_at", 0) > SESSION_TTL:
+            shutil.rmtree(s.get("session_dir", ""), ignore_errors=True)
+            sessions.pop(sid, None)
 
 
 @app.post("/api/session/create")
 def create_session():
+    cleanup_old_sessions()
     session_id = str(uuid.uuid4())
     session_dir = tempfile.mkdtemp(prefix="bookbundle_")
     sessions[session_id] = {
@@ -45,6 +60,7 @@ def create_session():
         "table_rows": [],
         "generated": {},     # output_name -> image_bytes
         "session_dir": session_dir,
+        "created_at": time.time(),
     }
     return {"session_id": session_id}
 
@@ -56,13 +72,16 @@ async def upload_images(
 ):
     session = get_session(session_id)
     saved = []
+    skipped = []
     for f in files:
         fn = f.filename or ""
         if not fn.lower().endswith(('.jpg', '.jpeg')):
+            skipped.append({"filename": fn, "reason": "不是 JPG/JPEG 格式"})
             continue
         # Extract leading digits as code
         m = re.match(r'^(\d+)', os.path.basename(fn))
         if not m:
+            skipped.append({"filename": fn, "reason": "文件名不是数字编码开头"})
             continue
         code = m.group(1)
         dest = os.path.join(session["session_dir"], fn)
@@ -72,7 +91,7 @@ async def upload_images(
         session["images"][code] = (fn, dest)
         saved.append(fn)
 
-    return {"count": len(session["images"]), "filenames": saved}
+    return {"count": len(session["images"]), "filenames": saved, "skipped": skipped}
 
 
 @app.post("/api/upload/table")
