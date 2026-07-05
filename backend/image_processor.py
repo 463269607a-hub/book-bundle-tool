@@ -1,5 +1,5 @@
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 from templates import TEMPLATES
 
 
@@ -185,31 +185,14 @@ def build_book_mask(img: Image.Image) -> Image.Image:
 
 
 def draw_book_shadow(canvas: Image.Image, mask_r: Image.Image, px: int, py: int):
-    """沿书的轮廓在其后方投双层影（四周均匀，不偏移）：
-      - 宽柔影：大范围淡影，给画面层次
-      - 缝隙线：紧贴边缘的深色窄影，像真实叠书的夹缝阴影，
-        深色封面压深色封面时也能看出边界（分隔主要靠它）
-    书底下的部分同时起接触投影作用。"""
+    """沿书的轮廓在其后方投一圈淡柔影（四周均匀，不偏移）。
+    只负责画面层次感——书与书的分隔靠"硬直边+完全不透明"本身，
+    不靠影子，也绝不画任何白/黑描边（用户均已否掉）。"""
     pad = 30          # 给模糊留的外扩空间
     big = Image.new('L', (mask_r.width + pad * 2, mask_r.height + pad * 2), 0)
     big.paste(mask_r, (pad, pad))
-
-    # 先记录画布这块区域哪里已经有书（在画柔影之前取，不被自己的影子干扰）
-    region = canvas.crop((px - pad, py - pad, px - pad + big.width, py - pad + big.height))
-    on_book = np.array(region.convert('RGB')).astype(np.int16).min(axis=2) < 240
-
-    soft = big.filter(ImageFilter.GaussianBlur(12)).point(lambda a: int(a * 0.35))
-    canvas.paste(Image.new('RGB', soft.size, (60, 60, 60)), (px - pad, py - pad), soft)
-
-    # 夹缝实线：mask 外扩 3px 减本体得到贴边环，近黑、高不透明度。
-    # 实物叠书的缝隙就是一条很深的线，渐变影压在深色封面上看不见，实线才分得开。
-    # 只画在已有书的区域——白底上不画，整套书外轮廓保持干净无黑边
-    rim = ImageChops.subtract(big.filter(ImageFilter.MaxFilter(7)), big)
-    rim = rim.filter(ImageFilter.GaussianBlur(1)).point(lambda a: int(a * 0.72))
-    rim_arr = np.array(rim)
-    rim_arr[~on_book] = 0
-    canvas.paste(Image.new('RGB', rim.size, (25, 25, 25)),
-                 (px - pad, py - pad), Image.fromarray(rim_arr))
+    soft = big.filter(ImageFilter.GaussianBlur(10)).point(lambda a: int(a * 0.40))
+    canvas.paste(Image.new('RGB', soft.size, (55, 55, 55)), (px - pad, py - pad), soft)
 
 
 def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Image:
@@ -240,7 +223,9 @@ def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Ima
                 new_h = int(bh * new_w / bw)
 
         resized = book.resize((new_w, new_h), Image.LANCZOS).convert('RGB')
-        mask_r = mask.resize((new_w, new_h), Image.BILINEAR)
+        # mask 缩放后二值化：书是不透明实体，边缘必须 100% 实心——
+        # 软边 alpha 会让前书边缘与后书颜色混在一起，正是"融合感"的来源
+        mask_r = mask.resize((new_w, new_h), Image.BILINEAR).point(lambda a: 255 if a >= 128 else 0)
         cx = slot['cx']
         # 底边对齐：书底落在 baseline，同排书无论高矮都站在同一条线上
         px = cx - new_w // 2
