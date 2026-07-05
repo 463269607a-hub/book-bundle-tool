@@ -79,17 +79,13 @@ async def upload_images(
         if not fn.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
             skipped.append({"filename": fn, "reason": "不支持的格式（仅支持 JPG/PNG/WebP）"})
             continue
-        # Extract leading digits as code
-        m = re.match(r'^(\d+)', os.path.basename(fn))
-        if not m:
-            skipped.append({"filename": fn, "reason": "文件名不是数字编码开头"})
-            continue
-        code = m.group(1)
+        # 文件名不要求数字开头，匹配时按"文件名包含编码"查找
+        fn = os.path.basename(fn)
         dest = os.path.join(session["session_dir"], fn)
         content = await f.read()
         with open(dest, 'wb') as fp:
             fp.write(content)
-        session["images"][code] = (fn, dest)
+        session["images"][fn] = dest
         saved.append(fn)
 
     return {"count": len(session["images"]), "filenames": saved, "skipped": skipped}
@@ -111,9 +107,9 @@ async def upload_table(
 
 
 def find_matching_code(code: str, images: dict) -> list:
-    """Find image keys matching code exactly."""
-    pattern = re.compile(r'^' + re.escape(code) + r'(?=\D|$)')
-    return [k for k in images.keys() if pattern.match(k)]
+    """文件名中包含该编码（前后不能紧挨其他数字，避免 2941 误命中 29412867）。"""
+    pattern = re.compile(r'(?<!\d)' + re.escape(code) + r'(?!\d)')
+    return [fn for fn in images.keys() if pattern.search(fn)]
 
 
 def validate_rows(session: dict) -> tuple:
@@ -223,7 +219,7 @@ def generate(body: dict):
                     book_imgs = []
                     for code in codes:
                         matches = find_matching_code(code, images)
-                        _, fpath = images[matches[0]]
+                        fpath = images[matches[0]]
                         img = Image.open(fpath)
                         img.load()
                         book_imgs.append(img)

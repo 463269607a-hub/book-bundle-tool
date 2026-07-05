@@ -14,32 +14,31 @@ def flatten_white(img: Image.Image) -> Image.Image:
     return img.convert('RGB')
 
 
-def _content_mask(img: Image.Image) -> np.ndarray:
-    """内容像素判定（裁剪与轮廓共用阈值）：
-    背景/投影 = 又亮又无彩色（min≥170 且 彩差≤28），其余算书的内容。
-    实拍图书底下的投影灰大多在 170~230，阈值收到 170 才能把投影排除，
-    否则书底边会带着一条参差的灰影（用户报过"书的下方很不均匀"）；
-    书上的文字/深色画面(min<170)和彩色区域(彩差>28)不受影响。"""
+def _masks(img: Image.Image) -> tuple:
+    """双阈值内容判定：
+    strict：只认印刷内容（min<170 或 彩差>28）——排除白底、投影、书页浅色边
+    loose ：只把纯白当背景（min<246 且 彩差≤10 为背景）——保住书页纸边。
+    书页纸边（纸张厚度那条浅色高光）是实体书的物理边缘，叠压时它就是
+    天然分界线；把它切掉封面画面会直接怼着封面画面 → "融合感"的真正根源。"""
     arr = np.array(img.convert('RGB')).astype(np.int16)
     mn = arr.min(axis=2)
     sat = arr.max(axis=2) - mn
-    return (mn < 170) | (sat > 28)
+    strict = (mn < 170) | (sat > 28)
+    loose = (mn < 246) | (sat > 10)
+    return strict, loose
+
+
+def _denoise(content: np.ndarray) -> np.ndarray:
+    """3×3 开运算去背景孤立噪点，避免带歪轮廓。"""
+    m = Image.fromarray((content.astype(np.uint8)) * 255)
+    m = m.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+    return np.array(m) > 0
 
 
 def crop_whitespace(img: Image.Image, shrink: int = 1) -> Image.Image:
-    """
-    用"饱和度判定"裁掉书四周的白底 + 灰色投影/抗锯齿一圈，裁到书的彩色内容为止。
-    这样实心叠压时前书边缘就是彩色，不会再有白边。书始终完整实心。
-
-    判定一个像素是"背景"（白底或灰投影）的共同特征：又亮又无彩色（R≈G≈B）。
-    阈值见 _content_mask。例：
-      纯白(255,255,255)、灰投影(200,200,200) → 背景，裁掉 ✓
-      淡黄(250,250,210) 彩差40>28 → 内容，保留 ✓
-      黑字(30,30,30) min=30<170 → 内容，保留 ✓
-
-    注：书内部"标题与插画之间"的白区在外接框内部，不会被裁（只裁四周边缘）。
-    """
-    is_content = _content_mask(img)
+    """按严格内容外接框裁白边（独立工具函数；主流程 process_row
+    改为先算 mask 再按 mask 外接框裁，避免这里把书页浅色边裁掉）。"""
+    is_content, _ = _masks(img)
 
     # 每行/列内容像素占比 > 3% 才算"有书"，过滤掉稀疏的边缘投影
     row_frac = is_content.mean(axis=1)
@@ -52,7 +51,6 @@ def crop_whitespace(img: Image.Image, shrink: int = 1) -> Image.Image:
     r0, r1 = int(rows[0]), int(rows[-1])
     c0, c1 = int(cols[0]), int(cols[-1])
 
-    # 再往里收 shrink 像素，吃掉最后一圈过渡像素
     sr0, sr1 = r0 + shrink, r1 - shrink
     sc0, sc1 = c0 + shrink, c1 - shrink
     if sr1 > sr0 and sc1 > sc0:
@@ -66,7 +64,7 @@ def crop_whitespace(img: Image.Image, shrink: int = 1) -> Image.Image:
 
 def _robust_line(xs: np.ndarray, ys: np.ndarray) -> tuple:
     """Theil–Sen 简化版直线拟合：随机点对斜率取中位数，
-    抗局部凹陷（封面浅色边缘）和噪点。返回 (斜率, 截距, 中位残差)。"""
+    抗局部凹陷和噪点。返回 (斜率, 截距, 中位残差)。"""
     xs = xs.astype(np.float64)
     ys = ys.astype(np.float64)
     n = len(xs)
@@ -83,50 +81,76 @@ def _robust_line(xs: np.ndarray, ys: np.ndarray) -> tuple:
     return m, b, resid
 
 
-def _fit_quad_mask(content: np.ndarray, h: int, w: int):
-    """把书轮廓拟合成四边形（四条边各拟合一条直线，取半平面交集），
-    再整体内收，切掉边缘全部白色过渡像素。拟合不像四边形时返回 None。"""
-    cols_any = content.any(axis=0)
-    rows_any = content.any(axis=1)
-    xs = np.where(cols_any)[0]
-    ys = np.where(rows_any)[0]
-    if len(xs) < w * 0.5 or len(ys) < h * 0.5:
+def _edge_profiles(content: np.ndarray, h: int, w: int) -> tuple:
+    top = content.argmax(axis=0)
+    bottom = h - 1 - content[::-1, :].argmax(axis=0)
+    left = content.argmax(axis=1)
+    right = w - 1 - content[:, ::-1].argmax(axis=1)
+    return top, bottom, left, right
+
+
+def _fit_quad_mask(strict: np.ndarray, loose: np.ndarray, h: int, w: int):
+    """实体书是长方体，正面拍摄的轮廓就是四边形——四条边各拟合一条直线。
+    上/左/右边优先用宽松阈值的边界线（把书页浅色物理边保在书内，
+    叠压时它就是天然分界线）；底边用严格线内收 2px（书底常有投影，必须切，
+    而底边在版式里要么贴画布底、要么被前排书挡住，切一点不可见）。
+    每条宽松线都有保护：偏离严格线超出容差（背景不干净）就退回严格线。
+    轮廓不像四边形（残差大）返回 None。"""
+    xs = np.where(strict.any(axis=0))[0]
+    ys = np.where(strict.any(axis=1))[0]
+    if len(xs) < 40 or len(ys) < 40:
         return None
 
-    # 掐掉两端 4%：角部的圆角/缺口不参与直线拟合
     def trim(idx):
-        k = max(2, int(len(idx) * 0.04))
+        k = max(2, int(len(idx) * 0.04))   # 掐掉两端 4%，角部不参与拟合
         return idx[k:-k]
 
     xs_t, ys_t = trim(xs), trim(ys)
-    first_r = content.argmax(axis=0)
-    last_r = h - 1 - content[::-1, :].argmax(axis=0)
-    first_c = content.argmax(axis=1)
-    last_c = w - 1 - content[:, ::-1].argmax(axis=1)
+    book_w, book_h = len(xs), len(ys)
+    max_resid = max(3.0, min(book_w, book_h) * 0.01)
 
-    fits = []
-    max_resid = max(3.0, min(h, w) * 0.01)
-    for dx, dy in ((xs_t, first_r[xs_t]), (xs_t, last_r[xs_t]),
-                   (ys_t, first_c[ys_t]), (ys_t, last_c[ys_t])):
-        mm, bb, resid = _robust_line(dx, dy)
-        if resid > max_resid:   # 这条边不直 → 不是规矩的四边形
-            return None
-        fits.append((mm, bb))
+    s_top, s_bot, s_left, s_right = _edge_profiles(strict, h, w)
+    l_top, _, l_left, l_right = _edge_profiles(loose, h, w)
 
-    (mt, bt), (mb_, bb_), (ml, bl), (mr, br) = fits
-    inset = max(3, int(min(h, w) * 0.006))   # 内收量随图片分辨率走
+    def fit(dx, dy):
+        m, b, resid = _robust_line(dx, dy)
+        return (m, b) if resid <= max_resid else None
+
+    top_s = fit(xs_t, s_top[xs_t])
+    bot_s = fit(xs_t, s_bot[xs_t])
+    left_s = fit(ys_t, s_left[ys_t])
+    right_s = fit(ys_t, s_right[ys_t])
+    if not all((top_s, bot_s, left_s, right_s)):
+        return None
+
+    def pick(strict_line, loose_prof, idx, outward_sign, tol):
+        """宽松线只允许比严格线向外 0~tol（书页边的合理厚度），
+        否则退回严格线。outward_sign=+1 向外为更小值(上/左)，-1 为更大值(下/右)。"""
+        lf = fit(idx, loose_prof[idx])
+        if lf is None:
+            return strict_line
+        mid = float(idx[len(idx) // 2])
+        d = ((strict_line[0] * mid + strict_line[1]) -
+             (lf[0] * mid + lf[1])) * outward_sign
+        return lf if -2 <= d <= tol else strict_line
+
+    top = pick(top_s, l_top, xs_t, +1, book_h * 0.08)
+    left = pick(left_s, l_left, ys_t, +1, book_w * 0.06)
+    right = pick(right_s, l_right, ys_t, -1, book_w * 0.06)
+    bot = (bot_s[0], bot_s[1] - 2)
+
     X = np.arange(w)[None, :]
     Y = np.arange(h)[:, None]
-    mask = ((Y >= mt * X + bt + inset) & (Y <= mb_ * X + bb_ - inset) &
-            (X >= ml * Y + bl + inset) & (X <= mr * Y + br - inset))
-    if mask.mean() < 0.5:   # 交集面积异常小 → 拟合失败
+    quad = ((Y >= top[0] * X + top[1]) & (Y <= bot[0] * X + bot[1]) &
+            (X >= left[0] * Y + left[1]) & (X <= right[0] * Y + right[1]))
+    if quad.sum() < 0.5 * book_w * book_h:   # 面积异常 → 拟合失败
         return None
-    return mask
+    return quad
 
 
 def _smooth_profile(vals: np.ndarray, frac: float = 0.03) -> np.ndarray:
-    """轮廓剖面滑动中值平滑：抹掉局部噪声造成的锯齿/波浪
-    （如底边被残留投影或高光顶出的凹凸），保留宽度大于窗口的真实转折（切角）。"""
+    """轮廓剖面滑动中值平滑：抹掉局部噪声的锯齿/波浪，
+    保留宽度大于窗口的真实转折（切角）。"""
     n = len(vals)
     win = max(5, int(n * frac)) | 1
     if n < win:
@@ -137,8 +161,7 @@ def _smooth_profile(vals: np.ndarray, frac: float = 0.03) -> np.ndarray:
 
 
 def _span_bool(content: np.ndarray, h: int, w: int) -> np.ndarray:
-    """行/列跨度填充取交集（贴合任意凸形轮廓），返回 bool 数组。
-    剖面先做中值平滑，边缘不出现锯齿。"""
+    """行/列跨度填充取交集（贴合任意凸形轮廓），剖面先中值平滑。"""
     cols = np.arange(w)
     rows_any = content.any(axis=1)
     first_c = _smooth_profile(content.argmax(axis=1))
@@ -155,40 +178,29 @@ def _span_bool(content: np.ndarray, h: int, w: int) -> np.ndarray:
 
 
 def build_book_mask(img: Image.Image) -> Image.Image:
-    """
-    书主体轮廓 mask。实体书是长方体，正面拍摄的轮廓就是（近似）四边形：
-    对上下左右四条边做抗噪直线拟合，取交集得到四边形，再整体内收几像素，
-    把边缘的白色过渡像素（抗锯齿圈、浅色书页边、照明渐变）全部切掉——
-    贴出来的边缘直接落在封面色块内，干净利落，无需描边遮丑。
+    """书主体轮廓 mask（在原图全幅上计算）：
+    四边形（上/左/右宽松保书页边、底边严格切投影）∩ 宽松跨度轮廓（角部不越界）。
     封面内部的白色区域必然在四边形内部，永远实心不穿帮。
-    但书侧面（书脊/切口）透视下轮廓是"切了角的四边形"，纯直线在角部会
-    越过实际边缘把白底圈进来 —— 所以四边形要再与跨度轮廓取交集：
-    直边处内收后的四边形赢（切掉白色过渡），角部跨度轮廓赢（不越界）。
-    轮廓不像四边形时（拟合残差大），退化为纯跨度填充。
-    """
-    content = _content_mask(img)
+    拟合失败回退严格跨度轮廓（原行为）。"""
+    strict, loose = _masks(img)
+    strict = _denoise(strict)
+    loose = _denoise(loose)
+    h, w = strict.shape
 
-    # 3×3 开运算去掉背景上的孤立噪点，避免噪点带歪拟合
-    m = Image.fromarray((content.astype(np.uint8)) * 255)
-    m = m.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
-    content = np.array(m) > 0
-    h, w = content.shape
-
-    final = _span_bool(content, h, w)
-    quad = _fit_quad_mask(content, h, w)
+    quad = _fit_quad_mask(strict, loose, h, w)
     if quad is not None:
-        final = final & quad
+        final = quad & _span_bool(loose, h, w)
+        return Image.fromarray((final.astype(np.uint8)) * 255)
 
-    mask = Image.fromarray((final.astype(np.uint8)) * 255)
-    # 再往里收 1px，吃掉跨度轮廓段边缘最后一圈过渡像素
-    return mask.filter(ImageFilter.MinFilter(3))
+    final = _span_bool(strict, h, w)
+    return Image.fromarray((final.astype(np.uint8)) * 255).filter(ImageFilter.MinFilter(3))
 
 
 def draw_book_shadow(canvas: Image.Image, mask_r: Image.Image, px: int, py: int):
-    """沿书的轮廓在其后方投一圈淡柔影（四周均匀，不偏移）。
-    只负责画面层次感——书与书的分隔靠"硬直边+完全不透明"本身，
+    """沿书的轮廓在其后方投一圈淡柔影（四周均匀，不偏移），只给画面层次感。
+    书与书的分隔靠"书页物理边 + 硬直边 + 完全不透明"，
     不靠影子，也绝不画任何白/黑描边（用户均已否掉）。"""
-    pad = 30          # 给模糊留的外扩空间
+    pad = 30
     big = Image.new('L', (mask_r.width + pad * 2, mask_r.height + pad * 2), 0)
     big.paste(mask_r, (pad, pad))
     soft = big.filter(ImageFilter.GaussianBlur(10)).point(lambda a: int(a * 0.40))
@@ -224,15 +236,13 @@ def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Ima
 
         resized = book.resize((new_w, new_h), Image.LANCZOS).convert('RGB')
         # mask 缩放后二值化：书是不透明实体，边缘必须 100% 实心——
-        # 软边 alpha 会让前书边缘与后书颜色混在一起，正是"融合感"的来源
+        # 软边 alpha 会让前书边缘与后书颜色混在一起，也是"融合感"来源之一
         mask_r = mask.resize((new_w, new_h), Image.BILINEAR).point(lambda a: 255 if a >= 128 else 0)
         cx = slot['cx']
         # 底边对齐：书底落在 baseline，同排书无论高矮都站在同一条线上
         px = cx - new_w // 2
         py = slot['baseline'] - new_h
 
-        # 按 z 顺序：轮廓柔影 → 书本体。四边形 mask 已把白色过渡像素切干净，
-        # 边缘就是封面色块，不再需要描边；书与书的分隔靠影子
         draw_book_shadow(canvas, mask_r, px, py)
         canvas.paste(resized, (px, py), mask_r)
 
@@ -246,6 +256,15 @@ def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Ima
 def process_row(book_images: list, n_books: int, debug: bool = False) -> Image.Image:
     books = []
     for img in book_images:
-        cropped = crop_whitespace(flatten_white(img))
-        books.append((cropped, build_book_mask(cropped)))
+        img = flatten_white(img)
+        # 先在原图全幅上算 mask，再按 mask 外接框裁剪——
+        # 若先按颜色裁剪会把书页浅色边裁掉，mask 再准也保不住物理边
+        mask = build_book_mask(img)
+        am = np.array(mask)
+        rows = np.where(am.any(axis=1))[0]
+        cols = np.where(am.any(axis=0))[0]
+        if len(rows) < 20 or len(cols) < 20:
+            raise ValueError("主体裁剪异常")
+        box = (int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1)
+        books.append((img.crop(box), mask.crop(box)))
     return composite_books(books, n_books, debug=debug)
