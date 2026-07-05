@@ -3,6 +3,17 @@ from PIL import Image, ImageDraw, ImageFilter
 from templates import TEMPLATES
 
 
+def flatten_white(img: Image.Image) -> Image.Image:
+    """带透明通道的图（PNG/WebP）先压到白底再处理，
+    直接 convert('RGB') 会把透明区变黑，导致裁剪和轮廓全错。"""
+    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+        rgba = img.convert('RGBA')
+        bg = Image.new('RGB', rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.getchannel('A'))
+        return bg
+    return img.convert('RGB')
+
+
 def _content_mask(img: Image.Image) -> np.ndarray:
     """内容像素判定（与 crop_whitespace 同一套阈值）：
     背景/投影 = 又亮又无彩色（min≥200 且 彩差≤28），其余算书的内容。"""
@@ -89,6 +100,21 @@ def build_book_mask(img: Image.Image) -> Image.Image:
     return mask.filter(ImageFilter.MinFilter(3))
 
 
+def draw_shadow(canvas: Image.Image, cx: int, baseline: int, book_w: int):
+    """书底部的椭圆形接触投影：椭圆中心线落在 baseline，
+    上半被随后贴的书盖住，下半在书底下渐隐，让书"立"在画面上。"""
+    sw = int(book_w * 0.94)
+    sh = max(8, int(book_w * 0.10))
+    blur = max(3, sh // 3)
+    pad = blur * 3
+    tile = Image.new('L', (sw + pad * 2, sh + pad * 2), 0)
+    d = ImageDraw.Draw(tile)
+    d.ellipse([pad, pad, pad + sw, pad + sh], fill=105)
+    tile = tile.filter(ImageFilter.GaussianBlur(blur))
+    gray = Image.new('RGB', tile.size, (110, 110, 110))
+    canvas.paste(gray, (cx - tile.width // 2, baseline - sh // 2 - pad), tile)
+
+
 def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Image:
     """books: [(书图, 轮廓mask), ...]"""
     template = TEMPLATES[n_books]
@@ -123,6 +149,8 @@ def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Ima
         px = cx - new_w // 2
         py = slot['baseline'] - new_h
 
+        # 先画投影再贴书（按 z 顺序，被前排书挡住的投影会自然被盖掉）
+        draw_shadow(canvas, cx, slot['baseline'], new_w)
         # 按书形轮廓粘贴：轮廓内实心不穿帮，轮廓外残留白底不再压到后排书
         canvas.paste(resized, (px, py), mask_r)
 
@@ -136,6 +164,6 @@ def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Ima
 def process_row(book_images: list, n_books: int, debug: bool = False) -> Image.Image:
     books = []
     for img in book_images:
-        cropped = crop_whitespace(img)
+        cropped = crop_whitespace(flatten_white(img))
         books.append((cropped, build_book_mask(cropped)))
     return composite_books(books, n_books, debug=debug)

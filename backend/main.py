@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -75,8 +76,8 @@ async def upload_images(
     skipped = []
     for f in files:
         fn = f.filename or ""
-        if not fn.lower().endswith(('.jpg', '.jpeg')):
-            skipped.append({"filename": fn, "reason": "不是 JPG/JPEG 格式"})
+        if not fn.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+            skipped.append({"filename": fn, "reason": "不支持的格式（仅支持 JPG/PNG/WebP）"})
             continue
         # Extract leading digits as code
         m = re.match(r'^(\d+)', os.path.basename(fn))
@@ -174,59 +175,92 @@ def validate(body: dict):
 
 @app.post("/api/generate")
 def generate(body: dict):
+    """启动后台生成线程并立即返回，前端轮询 /api/generate/status 拿真实进度。"""
     session_id = body.get("session_id")
     debug = body.get("debug", False)
     session = get_session(session_id)
     images = session["images"]
 
+    prev = session.get("gen_state")
+    if prev and prev.get("running"):
+        raise HTTPException(status_code=409, detail="正在生成中，请稍候")
+
     generatable, pre_failed = validate_rows(session)
-    results = []
-    gen_failed = list(pre_failed)
+    state = {
+        "running": True,
+        "current": 0,
+        "total": len(generatable),
+        "results": [],
+        "failed": list(pre_failed),
+    }
+    session["gen_state"] = state
+    # 每次重新生成清空上一轮结果，避免 ZIP 里混入旧文件
+    session["generated"] = {}
 
-    # Track output name duplicates
-    name_counts: dict = {}
+    def worker():
+        # Track output name duplicates
+        name_counts: dict = {}
 
-    def unique_name(name: str) -> str:
-        if name not in name_counts:
-            name_counts[name] = 1
-            return name
-        else:
-            name_counts[name] += 1
-            return f"{name}_{name_counts[name]}"
-
-    for row in generatable:
-        codes = []
-        for i in range(1, 6):
-            c = row.get(f'code_{i}')
-            if c:
-                codes.append(c)
-        n = len(codes)
-        output_name = unique_name(row['output_name'])
+        def unique_name(name: str) -> str:
+            if name not in name_counts:
+                name_counts[name] = 1
+                return name
+            else:
+                name_counts[name] += 1
+                return f"{name}_{name_counts[name]}"
 
         try:
-            book_imgs = []
-            for code in codes:
-                matches = find_matching_code(code, images)
-                _, fpath = images[matches[0]]
-                img = Image.open(fpath)
-                img.load()
-                book_imgs.append(img)
+            for row in generatable:
+                codes = []
+                for i in range(1, 6):
+                    c = row.get(f'code_{i}')
+                    if c:
+                        codes.append(c)
+                n = len(codes)
+                output_name = unique_name(row['output_name'])
 
-            result_img = process_row(book_imgs, n, debug=debug)
+                try:
+                    book_imgs = []
+                    for code in codes:
+                        matches = find_matching_code(code, images)
+                        _, fpath = images[matches[0]]
+                        img = Image.open(fpath)
+                        img.load()
+                        book_imgs.append(img)
 
-            buf = io.BytesIO()
-            result_img.save(buf, format='JPEG', quality=95)
-            img_bytes = buf.getvalue()
+                    result_img = process_row(book_imgs, n, debug=debug)
 
-            session["generated"][output_name] = img_bytes
+                    buf = io.BytesIO()
+                    result_img.save(buf, format='JPEG', quality=95)
+                    img_bytes = buf.getvalue()
 
-            img_b64 = base64.b64encode(img_bytes).decode('utf-8')
-            results.append({"output_name": output_name, "image_b64": img_b64})
+                    session["generated"][output_name] = img_bytes
 
-        except Exception as e:
-            gen_failed.append({"row": row, "reason": str(e)})
+                    img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+                    state["results"].append({"output_name": output_name, "image_b64": img_b64})
 
-    return {"results": results, "failed": gen_failed}
+                except Exception as e:
+                    state["failed"].append({"row": row, "reason": str(e)})
+
+                state["current"] += 1
+        finally:
+            state["running"] = False
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"started": True, "total": state["total"]}
+
+
+@app.get("/api/generate/status/{session_id}")
+def generate_status(session_id: str):
+    session = get_session(session_id)
+    state = session.get("gen_state")
+    if not state:
+        return {"running": False, "current": 0, "total": 0, "results": [], "failed": []}
+    resp = {"running": state["running"], "current": state["current"], "total": state["total"]}
+    if not state["running"]:
+        resp["results"] = state["results"]
+        resp["failed"] = state["failed"]
+    return resp
 
 
 @app.get("/api/download/image/{session_id}/{output_name}")

@@ -50,14 +50,14 @@ export default function UploadImages({ sessionId, onUploaded, onSessionExpired }
       <input
         ref={inputRef}
         type="file"
-        accept=".jpg,.jpeg"
+        accept=".jpg,.jpeg,.png,.webp"
         multiple
         onChange={onInputChange}
         style={{ display: 'none' }}
       />
       <div className="upload-icon">🖼️</div>
       <div className="upload-label">上传书籍图片</div>
-      <div className="upload-hint">拖拽或点击选择 JPG 图片（可多选）</div>
+      <div className="upload-hint">拖拽或点击选择 JPG / PNG / WebP 图片（可多选）</div>
       <div className="upload-hint" style={{ marginTop: 4 }}>文件名须以数字编码开头，如：9787010123456.jpg</div>
       {uploading && <div className="upload-count" style={{ background: '#fff3cd', color: '#856404' }}>上传中...</div>}
       {!uploading && count > 0 && (

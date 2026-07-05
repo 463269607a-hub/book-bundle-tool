@@ -87,9 +87,21 @@ export default function App() {
       })
       if (res.status === 404) { handleSessionExpired(); return }
       const data = await res.json()
-      setResults(data.results || [])
-      setAllFailed(data.failed || [])
-      setGenerateProgress({ current: data.results?.length || 0, total: validationResult.generatable.length })
+      if (!res.ok) { alert('生成失败：' + (data.detail || res.status)); return }
+      setGenerateProgress({ current: 0, total: data.total })
+      // 轮询后台生成进度，直到完成
+      for (;;) {
+        await new Promise(r => setTimeout(r, 500))
+        const sres = await fetch(`/api/generate/status/${sessionId}`)
+        if (sres.status === 404) { handleSessionExpired(); return }
+        const s = await sres.json()
+        setGenerateProgress({ current: s.current, total: s.total })
+        if (!s.running) {
+          setResults(s.results || [])
+          setAllFailed(s.failed || [])
+          break
+        }
+      }
     } catch (e) {
       alert('生成失败：' + e.message)
     } finally {
