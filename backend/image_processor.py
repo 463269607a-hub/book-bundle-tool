@@ -64,25 +64,68 @@ def crop_whitespace(img: Image.Image, shrink: int = 1) -> Image.Image:
     return cropped
 
 
-def build_book_mask(img: Image.Image) -> Image.Image:
-    """
-    书主体轮廓 mask（跨度填充法），解决叠压时外接框残留白底压出白边的问题：
-      - 每一行：从最左内容像素填到最右内容像素
-      - 每一列：从最上内容像素填到最下内容像素
-      - 取交集 → 贴合书形（含立体书斜边/圆角）的实心轮廓
+def _robust_line(xs: np.ndarray, ys: np.ndarray) -> tuple:
+    """Theil–Sen 简化版直线拟合：随机点对斜率取中位数，
+    抗局部凹陷（封面浅色边缘）和噪点。返回 (斜率, 截距, 中位残差)。"""
+    xs = xs.astype(np.float64)
+    ys = ys.astype(np.float64)
+    n = len(xs)
+    if n < 20:
+        return 0.0, float(np.median(ys)), 0.0
+    rng = np.random.default_rng(0)
+    i = rng.integers(0, n, 4000)
+    j = rng.integers(0, n, 4000)
+    span = xs[i] - xs[j]
+    ok = np.abs(span) > (xs.max() - xs.min()) * 0.2
+    m = float(np.median((ys[i][ok] - ys[j][ok]) / span[ok])) if ok.sum() >= 50 else 0.0
+    b = float(np.median(ys - m * xs))
+    resid = float(np.median(np.abs(ys - (m * xs + b))))
+    return m, b, resid
 
-    外接框内、书轮廓外的残留白底（尤其书顶上方两角）变透明；
-    封面内部的白色区域左右上下都有内容包着，必然落在轮廓内，
-    仍然实心不透明 —— 不会穿帮。
-    """
-    content = _content_mask(img)
 
-    # 3×3 开运算去掉背景上的孤立噪点，避免噪点把跨度撑大
-    m = Image.fromarray((content.astype(np.uint8)) * 255)
-    m = m.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
-    content = np.array(m) > 0
+def _fit_quad_mask(content: np.ndarray, h: int, w: int):
+    """把书轮廓拟合成四边形（四条边各拟合一条直线，取半平面交集），
+    再整体内收，切掉边缘全部白色过渡像素。拟合不像四边形时返回 None。"""
+    cols_any = content.any(axis=0)
+    rows_any = content.any(axis=1)
+    xs = np.where(cols_any)[0]
+    ys = np.where(rows_any)[0]
+    if len(xs) < w * 0.5 or len(ys) < h * 0.5:
+        return None
 
-    h, w = content.shape
+    # 掐掉两端 4%：角部的圆角/缺口不参与直线拟合
+    def trim(idx):
+        k = max(2, int(len(idx) * 0.04))
+        return idx[k:-k]
+
+    xs_t, ys_t = trim(xs), trim(ys)
+    first_r = content.argmax(axis=0)
+    last_r = h - 1 - content[::-1, :].argmax(axis=0)
+    first_c = content.argmax(axis=1)
+    last_c = w - 1 - content[:, ::-1].argmax(axis=1)
+
+    fits = []
+    max_resid = max(3.0, min(h, w) * 0.01)
+    for dx, dy in ((xs_t, first_r[xs_t]), (xs_t, last_r[xs_t]),
+                   (ys_t, first_c[ys_t]), (ys_t, last_c[ys_t])):
+        mm, bb, resid = _robust_line(dx, dy)
+        if resid > max_resid:   # 这条边不直 → 不是规矩的四边形
+            return None
+        fits.append((mm, bb))
+
+    (mt, bt), (mb_, bb_), (ml, bl), (mr, br) = fits
+    inset = max(3, int(min(h, w) * 0.006))   # 内收量随图片分辨率走
+    X = np.arange(w)[None, :]
+    Y = np.arange(h)[:, None]
+    mask = ((Y >= mt * X + bt + inset) & (Y <= mb_ * X + bb_ - inset) &
+            (X >= ml * Y + bl + inset) & (X <= mr * Y + br - inset))
+    if mask.mean() < 0.5:   # 交集面积异常小 → 拟合失败
+        return None
+    return mask
+
+
+def _span_mask(content: np.ndarray, h: int, w: int) -> Image.Image:
+    """回退方案：行/列跨度填充取交集（贴合任意凸形轮廓）。"""
     cols = np.arange(w)
     rows_any = content.any(axis=1)
     first_c = content.argmax(axis=1)
@@ -96,8 +139,31 @@ def build_book_mask(img: Image.Image) -> Image.Image:
     col_span = cols_any[None, :] & (rows >= first_r[None, :]) & (rows <= last_r[None, :])
 
     mask = Image.fromarray(((row_span & col_span).astype(np.uint8)) * 255)
-    # 再往里收 1px，吃掉轮廓边缘最后一圈发白的过渡像素
+    # 往里收 1px，吃掉轮廓边缘最后一圈发白的过渡像素
     return mask.filter(ImageFilter.MinFilter(3))
+
+
+def build_book_mask(img: Image.Image) -> Image.Image:
+    """
+    书主体轮廓 mask。实体书是长方体，正面拍摄的轮廓就是（近似）四边形：
+    对上下左右四条边做抗噪直线拟合，取交集得到四边形，再整体内收几像素，
+    把边缘的白色过渡像素（抗锯齿圈、浅色书页边、照明渐变）全部切掉——
+    贴出来的边缘直接落在封面色块内，干净利落，无需描边遮丑。
+    封面内部的白色区域必然在四边形内部，永远实心不穿帮。
+    轮廓不像四边形时（拟合残差大），回退到行/列跨度填充法。
+    """
+    content = _content_mask(img)
+
+    # 3×3 开运算去掉背景上的孤立噪点，避免噪点带歪拟合
+    m = Image.fromarray((content.astype(np.uint8)) * 255)
+    m = m.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+    content = np.array(m) > 0
+    h, w = content.shape
+
+    quad = _fit_quad_mask(content, h, w)
+    if quad is not None:
+        return Image.fromarray((quad.astype(np.uint8)) * 255)
+    return _span_mask(content, h, w)
 
 
 def draw_book_shadow(canvas: Image.Image, mask_r: Image.Image, px: int, py: int):
@@ -148,18 +214,9 @@ def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Ima
         px = cx - new_w // 2
         py = slot['baseline'] - new_h
 
-        # 发丝白线轮廓：mask 装进外扩画布再膨胀 1px（直接膨胀会被矩形边界截掉贴边处）。
-        # 只在深色压深色、影子看不出来时兜底分隔；太宽会像抠图残留白边（用户反馈过 4px 太宽）
-        ring_pad = 4
-        ring = Image.new('L', (new_w + ring_pad * 2, new_h + ring_pad * 2), 0)
-        ring.paste(mask_r, (ring_pad, ring_pad))
-        ring = ring.filter(ImageFilter.MaxFilter(3))
-
-        # 按 z 顺序：影子（沿描边外缘）→ 白描边 → 书本体
-        draw_book_shadow(canvas, ring, px - ring_pad, py - ring_pad)
-        canvas.paste(Image.new('RGB', ring.size, (255, 255, 255)),
-                     (px - ring_pad, py - ring_pad), ring)
-        # 按书形轮廓粘贴：轮廓内实心不穿帮，轮廓外残留白底不再压到后排书
+        # 按 z 顺序：轮廓柔影 → 书本体。四边形 mask 已把白色过渡像素切干净，
+        # 边缘就是封面色块，不再需要描边；书与书的分隔靠影子
+        draw_book_shadow(canvas, mask_r, px, py)
         canvas.paste(resized, (px, py), mask_r)
 
         if debug:
