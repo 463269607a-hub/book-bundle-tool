@@ -1,6 +1,15 @@
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from templates import TEMPLATES
+
+
+def _content_mask(img: Image.Image) -> np.ndarray:
+    """内容像素判定（与 crop_whitespace 同一套阈值）：
+    背景/投影 = 又亮又无彩色（min≥200 且 彩差≤28），其余算书的内容。"""
+    arr = np.array(img.convert('RGB')).astype(np.int16)
+    mn = arr.min(axis=2)
+    sat = arr.max(axis=2) - mn
+    return (mn < 200) | (sat > 28)
 
 
 def crop_whitespace(img: Image.Image, shrink: int = 1) -> Image.Image:
@@ -19,10 +28,7 @@ def crop_whitespace(img: Image.Image, shrink: int = 1) -> Image.Image:
 
     注：书内部"标题与插画之间"的白区在外接框内部，不会被裁（只裁四周边缘）。
     """
-    arr = np.array(img.convert('RGB')).astype(np.int16)
-    mn = arr.min(axis=2)
-    sat = arr.max(axis=2) - mn
-    is_content = (mn < 200) | (sat > 28)
+    is_content = _content_mask(img)
 
     # 每行/列内容像素占比 > 3% 才算"有书"，过滤掉稀疏的边缘投影
     row_frac = is_content.mean(axis=1)
@@ -47,12 +53,49 @@ def crop_whitespace(img: Image.Image, shrink: int = 1) -> Image.Image:
     return cropped
 
 
-def composite_books(book_images: list, n_books: int, debug: bool = False) -> Image.Image:
+def build_book_mask(img: Image.Image) -> Image.Image:
+    """
+    书主体轮廓 mask（跨度填充法），解决叠压时外接框残留白底压出白边的问题：
+      - 每一行：从最左内容像素填到最右内容像素
+      - 每一列：从最上内容像素填到最下内容像素
+      - 取交集 → 贴合书形（含立体书斜边/圆角）的实心轮廓
+
+    外接框内、书轮廓外的残留白底（尤其书顶上方两角）变透明；
+    封面内部的白色区域左右上下都有内容包着，必然落在轮廓内，
+    仍然实心不透明 —— 不会穿帮。
+    """
+    content = _content_mask(img)
+
+    # 3×3 开运算去掉背景上的孤立噪点，避免噪点把跨度撑大
+    m = Image.fromarray((content.astype(np.uint8)) * 255)
+    m = m.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+    content = np.array(m) > 0
+
+    h, w = content.shape
+    cols = np.arange(w)
+    rows_any = content.any(axis=1)
+    first_c = content.argmax(axis=1)
+    last_c = w - 1 - content[:, ::-1].argmax(axis=1)
+    row_span = rows_any[:, None] & (cols >= first_c[:, None]) & (cols <= last_c[:, None])
+
+    rows = np.arange(h)[:, None]
+    cols_any = content.any(axis=0)
+    first_r = content.argmax(axis=0)
+    last_r = h - 1 - content[::-1, :].argmax(axis=0)
+    col_span = cols_any[None, :] & (rows >= first_r[None, :]) & (rows <= last_r[None, :])
+
+    mask = Image.fromarray(((row_span & col_span).astype(np.uint8)) * 255)
+    # 再往里收 1px，吃掉轮廓边缘最后一圈发白的过渡像素
+    return mask.filter(ImageFilter.MinFilter(3))
+
+
+def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Image:
+    """books: [(书图, 轮廓mask), ...]"""
     template = TEMPLATES[n_books]
     canvas = Image.new('RGB', (800, 800), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
-    for slot, book in zip(sorted(template, key=lambda s: s['z']), book_images):
+    for slot, (book, mask) in zip(sorted(template, key=lambda s: s['z']), books):
         bw, bh = book.size
         if bh == 0 or bw == 0:
             continue
@@ -74,13 +117,14 @@ def composite_books(book_images: list, n_books: int, debug: bool = False) -> Ima
                 new_h = int(bh * new_w / bw)
 
         resized = book.resize((new_w, new_h), Image.LANCZOS).convert('RGB')
+        mask_r = mask.resize((new_w, new_h), Image.BILINEAR)
         cx = slot['cx']
         # 底边对齐：书底落在 baseline，同排书无论高矮都站在同一条线上
         px = cx - new_w // 2
         py = slot['baseline'] - new_h
 
-        # 始终不透明粘贴 —— 书永远实心，绝不穿帮
-        canvas.paste(resized, (px, py))
+        # 按书形轮廓粘贴：轮廓内实心不穿帮，轮廓外残留白底不再压到后排书
+        canvas.paste(resized, (px, py), mask_r)
 
         if debug:
             draw.rectangle([px, py, px + new_w - 1, py + new_h - 1],
@@ -90,5 +134,8 @@ def composite_books(book_images: list, n_books: int, debug: bool = False) -> Ima
 
 
 def process_row(book_images: list, n_books: int, debug: bool = False) -> Image.Image:
-    cropped = [crop_whitespace(img) for img in book_images]
-    return composite_books(cropped, n_books, debug=debug)
+    books = []
+    for img in book_images:
+        cropped = crop_whitespace(img)
+        books.append((cropped, build_book_mask(cropped)))
+    return composite_books(books, n_books, debug=debug)
