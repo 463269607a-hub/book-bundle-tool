@@ -104,12 +104,12 @@ def draw_book_shadow(canvas: Image.Image, mask_r: Image.Image, px: int, py: int)
     """沿书的轮廓在其后方投一圈柔影（drop shadow）：
     叠压时前书边缘与后书之间有明暗分隔，一眼分得清哪本是哪本；
     书底下的部分同时起接触投影作用，让书"立"在画面上。"""
-    pad = 18          # 给模糊留的外扩空间
-    blur = 8
-    off_x, off_y = 0, 3   # 影子略微下沉，像顶光照射
+    pad = 24          # 给模糊留的外扩空间
+    blur = 10
+    off_x, off_y = 0, 0   # 四周均匀：4/5本最需要分隔的是前书"顶边"，影子不能往下偏
     big = Image.new('L', (mask_r.width + pad * 2, mask_r.height + pad * 2), 0)
     big.paste(mask_r, (pad, pad))
-    big = big.filter(ImageFilter.GaussianBlur(blur)).point(lambda a: int(a * 0.5))
+    big = big.filter(ImageFilter.GaussianBlur(blur)).point(lambda a: int(a * 0.55))
     dark = Image.new('RGB', big.size, (70, 70, 70))
     canvas.paste(dark, (px - pad + off_x, py - pad + off_y), big)
 
@@ -148,13 +148,12 @@ def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Ima
         px = cx - new_w // 2
         py = slot['baseline'] - new_h
 
-        # 白色描边轮廓：mask 装进外扩画布再膨胀 4px（直接膨胀会被矩形边界截掉贴边处的描边）。
-        # 深色压深色时灰影分不开，细白边保证任何配色下书与书边界都清晰；
-        # 白底上描边不可见，只在叠压处生效
-        ring_pad = 6
+        # 发丝白线轮廓：mask 装进外扩画布再膨胀 1px（直接膨胀会被矩形边界截掉贴边处）。
+        # 只在深色压深色、影子看不出来时兜底分隔；太宽会像抠图残留白边（用户反馈过 4px 太宽）
+        ring_pad = 4
         ring = Image.new('L', (new_w + ring_pad * 2, new_h + ring_pad * 2), 0)
         ring.paste(mask_r, (ring_pad, ring_pad))
-        ring = ring.filter(ImageFilter.MaxFilter(9))
+        ring = ring.filter(ImageFilter.MaxFilter(3))
 
         # 按 z 顺序：影子（沿描边外缘）→ 白描边 → 书本体
         draw_book_shadow(canvas, ring, px - ring_pad, py - ring_pad)
