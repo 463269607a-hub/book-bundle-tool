@@ -106,7 +106,7 @@ def draw_book_shadow(canvas: Image.Image, mask_r: Image.Image, px: int, py: int)
     书底下的部分同时起接触投影作用，让书"立"在画面上。"""
     pad = 18          # 给模糊留的外扩空间
     blur = 8
-    off_x, off_y = 0, 5   # 影子略微下沉，像顶光照射
+    off_x, off_y = 0, 3   # 影子略微下沉，像顶光照射
     big = Image.new('L', (mask_r.width + pad * 2, mask_r.height + pad * 2), 0)
     big.paste(mask_r, (pad, pad))
     big = big.filter(ImageFilter.GaussianBlur(blur)).point(lambda a: int(a * 0.5))
@@ -148,8 +148,18 @@ def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Ima
         px = cx - new_w // 2
         py = slot['baseline'] - new_h
 
-        # 先画轮廓投影再贴书（按 z 顺序，前书的影子落在后书上形成层次分隔）
-        draw_book_shadow(canvas, mask_r, px, py)
+        # 白色描边轮廓：mask 装进外扩画布再膨胀 4px（直接膨胀会被矩形边界截掉贴边处的描边）。
+        # 深色压深色时灰影分不开，细白边保证任何配色下书与书边界都清晰；
+        # 白底上描边不可见，只在叠压处生效
+        ring_pad = 6
+        ring = Image.new('L', (new_w + ring_pad * 2, new_h + ring_pad * 2), 0)
+        ring.paste(mask_r, (ring_pad, ring_pad))
+        ring = ring.filter(ImageFilter.MaxFilter(9))
+
+        # 按 z 顺序：影子（沿描边外缘）→ 白描边 → 书本体
+        draw_book_shadow(canvas, ring, px - ring_pad, py - ring_pad)
+        canvas.paste(Image.new('RGB', ring.size, (255, 255, 255)),
+                     (px - ring_pad, py - ring_pad), ring)
         # 按书形轮廓粘贴：轮廓内实心不穿帮，轮廓外残留白底不再压到后排书
         canvas.paste(resized, (px, py), mask_r)
 
