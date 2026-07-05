@@ -100,19 +100,18 @@ def build_book_mask(img: Image.Image) -> Image.Image:
     return mask.filter(ImageFilter.MinFilter(3))
 
 
-def draw_shadow(canvas: Image.Image, cx: int, baseline: int, book_w: int):
-    """书底部的椭圆形接触投影：椭圆中心线落在 baseline，
-    上半被随后贴的书盖住，下半在书底下渐隐，让书"立"在画面上。"""
-    sw = int(book_w * 0.94)
-    sh = max(8, int(book_w * 0.10))
-    blur = max(3, sh // 3)
-    pad = blur * 3
-    tile = Image.new('L', (sw + pad * 2, sh + pad * 2), 0)
-    d = ImageDraw.Draw(tile)
-    d.ellipse([pad, pad, pad + sw, pad + sh], fill=105)
-    tile = tile.filter(ImageFilter.GaussianBlur(blur))
-    gray = Image.new('RGB', tile.size, (110, 110, 110))
-    canvas.paste(gray, (cx - tile.width // 2, baseline - sh // 2 - pad), tile)
+def draw_book_shadow(canvas: Image.Image, mask_r: Image.Image, px: int, py: int):
+    """沿书的轮廓在其后方投一圈柔影（drop shadow）：
+    叠压时前书边缘与后书之间有明暗分隔，一眼分得清哪本是哪本；
+    书底下的部分同时起接触投影作用，让书"立"在画面上。"""
+    pad = 18          # 给模糊留的外扩空间
+    blur = 8
+    off_x, off_y = 0, 5   # 影子略微下沉，像顶光照射
+    big = Image.new('L', (mask_r.width + pad * 2, mask_r.height + pad * 2), 0)
+    big.paste(mask_r, (pad, pad))
+    big = big.filter(ImageFilter.GaussianBlur(blur)).point(lambda a: int(a * 0.5))
+    dark = Image.new('RGB', big.size, (70, 70, 70))
+    canvas.paste(dark, (px - pad + off_x, py - pad + off_y), big)
 
 
 def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Image:
@@ -149,8 +148,8 @@ def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Ima
         px = cx - new_w // 2
         py = slot['baseline'] - new_h
 
-        # 先画投影再贴书（按 z 顺序，被前排书挡住的投影会自然被盖掉）
-        draw_shadow(canvas, cx, slot['baseline'], new_w)
+        # 先画轮廓投影再贴书（按 z 顺序，前书的影子落在后书上形成层次分隔）
+        draw_book_shadow(canvas, mask_r, px, py)
         # 按书形轮廓粘贴：轮廓内实心不穿帮，轮廓外残留白底不再压到后排书
         canvas.paste(resized, (px, py), mask_r)
 
