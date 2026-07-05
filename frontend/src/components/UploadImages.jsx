@@ -1,5 +1,32 @@
 import { useRef, useState } from 'react'
 
+// 上传前浏览器内压缩：合成输出仅 800x800，原图缩到长边 1600px 足够，
+// 体积小约10倍 → 同样带宽下上传快约10倍（服务器带宽只有 ~1Mbps）
+async function compressImage(file) {
+  if (file.size < 300 * 1024) return file
+  let bmp
+  try {
+    bmp = await createImageBitmap(file)
+  } catch {
+    return file
+  }
+  const maxDim = 1600
+  const scale = Math.min(1, maxDim / Math.max(bmp.width, bmp.height))
+  const w = Math.round(bmp.width * scale)
+  const h = Math.round(bmp.height * scale)
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = '#ffffff'   // 透明 PNG 压白底
+  ctx.fillRect(0, 0, w, h)
+  ctx.drawImage(bmp, 0, 0, w, h)
+  const blob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.87))
+  if (!blob || blob.size >= file.size) return file
+  const newName = file.name.replace(/\.(png|webp|jpeg|jpg)$/i, '') + '.jpg'
+  return new File([blob], newName, { type: 'image/jpeg' })
+}
+
 export default function UploadImages({ sessionId, onUploaded, onSessionExpired }) {
   const [dragOver, setDragOver] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -10,9 +37,10 @@ export default function UploadImages({ sessionId, onUploaded, onSessionExpired }
   async function handleFiles(files) {
     if (!files || files.length === 0) return
     setUploading(true)
+    const compressed = await Promise.all([...files].map(compressImage))
     const fd = new FormData()
     fd.append('session_id', sessionId)
-    for (const f of files) {
+    for (const f of compressed) {
       fd.append('files', f)
     }
     try {
