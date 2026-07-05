@@ -1,5 +1,5 @@
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 from templates import TEMPLATES
 
 
@@ -15,12 +15,15 @@ def flatten_white(img: Image.Image) -> Image.Image:
 
 
 def _content_mask(img: Image.Image) -> np.ndarray:
-    """内容像素判定（与 crop_whitespace 同一套阈值）：
-    背景/投影 = 又亮又无彩色（min≥200 且 彩差≤28），其余算书的内容。"""
+    """内容像素判定（裁剪与轮廓共用阈值）：
+    背景/投影 = 又亮又无彩色（min≥170 且 彩差≤28），其余算书的内容。
+    实拍图书底下的投影灰大多在 170~230，阈值收到 170 才能把投影排除，
+    否则书底边会带着一条参差的灰影（用户报过"书的下方很不均匀"）；
+    书上的文字/深色画面(min<170)和彩色区域(彩差>28)不受影响。"""
     arr = np.array(img.convert('RGB')).astype(np.int16)
     mn = arr.min(axis=2)
     sat = arr.max(axis=2) - mn
-    return (mn < 200) | (sat > 28)
+    return (mn < 170) | (sat > 28)
 
 
 def crop_whitespace(img: Image.Image, shrink: int = 1) -> Image.Image:
@@ -29,13 +32,10 @@ def crop_whitespace(img: Image.Image, shrink: int = 1) -> Image.Image:
     这样实心叠压时前书边缘就是彩色，不会再有白边。书始终完整实心。
 
     判定一个像素是"背景"（白底或灰投影）的共同特征：又亮又无彩色（R≈G≈B）。
-      - 背景/投影像素：min(R,G,B) ≥ 200 且 (max-min) ≤ 28  →  裁掉
-      - 书的内容：要么有颜色(max-min>28)，要么够深(min<200) →  保留
-    例：
-      纯白(255,255,255)、灰投影(220,220,220) → 背景，裁掉 ✓
-      浅蓝天空(180,210,240) min=180<200 → 内容，保留 ✓
+    阈值见 _content_mask。例：
+      纯白(255,255,255)、灰投影(200,200,200) → 背景，裁掉 ✓
       淡黄(250,250,210) 彩差40>28 → 内容，保留 ✓
-      黑字(30,30,30) min=30<200 → 内容，保留 ✓
+      黑字(30,30,30) min=30<170 → 内容，保留 ✓
 
     注：书内部"标题与插画之间"的白区在外接框内部，不会被裁（只裁四周边缘）。
     """
@@ -124,18 +124,31 @@ def _fit_quad_mask(content: np.ndarray, h: int, w: int):
     return mask
 
 
+def _smooth_profile(vals: np.ndarray, frac: float = 0.03) -> np.ndarray:
+    """轮廓剖面滑动中值平滑：抹掉局部噪声造成的锯齿/波浪
+    （如底边被残留投影或高光顶出的凹凸），保留宽度大于窗口的真实转折（切角）。"""
+    n = len(vals)
+    win = max(5, int(n * frac)) | 1
+    if n < win:
+        return vals
+    padded = np.pad(vals, win // 2, mode='edge')
+    sw = np.lib.stride_tricks.sliding_window_view(padded, win)
+    return np.median(sw, axis=1).astype(vals.dtype)
+
+
 def _span_bool(content: np.ndarray, h: int, w: int) -> np.ndarray:
-    """行/列跨度填充取交集（贴合任意凸形轮廓），返回 bool 数组。"""
+    """行/列跨度填充取交集（贴合任意凸形轮廓），返回 bool 数组。
+    剖面先做中值平滑，边缘不出现锯齿。"""
     cols = np.arange(w)
     rows_any = content.any(axis=1)
-    first_c = content.argmax(axis=1)
-    last_c = w - 1 - content[:, ::-1].argmax(axis=1)
+    first_c = _smooth_profile(content.argmax(axis=1))
+    last_c = _smooth_profile(w - 1 - content[:, ::-1].argmax(axis=1))
     row_span = rows_any[:, None] & (cols >= first_c[:, None]) & (cols <= last_c[:, None])
 
     rows = np.arange(h)[:, None]
     cols_any = content.any(axis=0)
-    first_r = content.argmax(axis=0)
-    last_r = h - 1 - content[::-1, :].argmax(axis=0)
+    first_r = _smooth_profile(content.argmax(axis=0))
+    last_r = _smooth_profile(h - 1 - content[::-1, :].argmax(axis=0))
     col_span = cols_any[None, :] & (rows >= first_r[None, :]) & (rows <= last_r[None, :])
 
     return row_span & col_span
@@ -181,11 +194,22 @@ def draw_book_shadow(canvas: Image.Image, mask_r: Image.Image, px: int, py: int)
     big = Image.new('L', (mask_r.width + pad * 2, mask_r.height + pad * 2), 0)
     big.paste(mask_r, (pad, pad))
 
+    # 先记录画布这块区域哪里已经有书（在画柔影之前取，不被自己的影子干扰）
+    region = canvas.crop((px - pad, py - pad, px - pad + big.width, py - pad + big.height))
+    on_book = np.array(region.convert('RGB')).astype(np.int16).min(axis=2) < 240
+
     soft = big.filter(ImageFilter.GaussianBlur(12)).point(lambda a: int(a * 0.35))
     canvas.paste(Image.new('RGB', soft.size, (60, 60, 60)), (px - pad, py - pad), soft)
 
-    tight = big.filter(ImageFilter.GaussianBlur(3)).point(lambda a: int(a * 0.55))
-    canvas.paste(Image.new('RGB', tight.size, (35, 35, 35)), (px - pad, py - pad), tight)
+    # 夹缝实线：mask 外扩 3px 减本体得到贴边环，近黑、高不透明度。
+    # 实物叠书的缝隙就是一条很深的线，渐变影压在深色封面上看不见，实线才分得开。
+    # 只画在已有书的区域——白底上不画，整套书外轮廓保持干净无黑边
+    rim = ImageChops.subtract(big.filter(ImageFilter.MaxFilter(7)), big)
+    rim = rim.filter(ImageFilter.GaussianBlur(1)).point(lambda a: int(a * 0.72))
+    rim_arr = np.array(rim)
+    rim_arr[~on_book] = 0
+    canvas.paste(Image.new('RGB', rim.size, (25, 25, 25)),
+                 (px - pad, py - pad), Image.fromarray(rim_arr))
 
 
 def composite_books(books: list, n_books: int, debug: bool = False) -> Image.Image:
