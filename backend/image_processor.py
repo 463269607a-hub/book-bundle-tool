@@ -139,10 +139,44 @@ def _fit_quad_mask(strict: np.ndarray, loose: np.ndarray, h: int, w: int):
     right = pick(right_s, l_right, ys_t, -1, book_w * 0.06)
     bot = (bot_s[0], bot_s[1] - 2)
 
+    # ── 每条边界 = 拟合直线（绝对平直，小波动一律吸附到线上），
+    #    仅在"从两端连续延伸、深度超过容差"的真实缺角处（书脊顶斜切、圆角）
+    #    跟随实际轮廓 —— 既不出现台阶/波浪，也不把白底三角圈进书内 ──
+    def bounded(line, raw, lo, hi, n, tol, direction, empty):
+        """direction=+1：上/左边界（缺角=raw 比线更大）；-1：下/右（raw 更小）。
+        返回长度 n 的逐列/逐行边界数组；有效范围外置 empty（使 mask 为空）。"""
+        vals = line[0] * np.arange(n) + line[1]
+        out = np.full(n, float(empty))
+        out[lo:hi + 1] = vals[lo:hi + 1]
+        dev = (raw.astype(np.float64) - vals) * direction > tol
+        i = lo
+        while i <= hi and dev[i]:
+            out[i] = raw[i]
+            i += 1
+        j = hi
+        while j >= lo and dev[j]:
+            out[j] = raw[j]
+            j -= 1
+        return out
+
+    tol_v = max(4.0, book_h * 0.012)
+    tol_h = max(4.0, book_w * 0.012)
+    # 有效范围用宽松阈值的外延：书页纸边可能高于/宽于严格内容范围
+    # （顶边倾斜时纸边一端超出严格行范围，用严格范围会把纸边削平成台阶）
+    xs_l = np.where(loose.any(axis=0))[0]
+    ys_l = np.where(loose.any(axis=1))[0]
+    x_lo, x_hi = int(xs_l[0]), int(xs_l[-1])
+    y_lo, y_hi = int(ys_l[0]), int(ys_l[-1])
+
+    top_b = bounded(top, l_top, x_lo, x_hi, w, tol_v, +1, h + 1)
+    bot_b = bounded(bot, s_bot, x_lo, x_hi, w, tol_v, -1, -1)
+    left_b = bounded(left, l_left, y_lo, y_hi, h, tol_h, +1, w + 1)
+    right_b = bounded(right, l_right, y_lo, y_hi, h, tol_h, -1, -1)
+
     X = np.arange(w)[None, :]
     Y = np.arange(h)[:, None]
-    quad = ((Y >= top[0] * X + top[1]) & (Y <= bot[0] * X + bot[1]) &
-            (X >= left[0] * Y + left[1]) & (X <= right[0] * Y + right[1]))
+    quad = ((Y >= top_b[None, :]) & (Y <= bot_b[None, :]) &
+            (X >= left_b[:, None]) & (X <= right_b[:, None]))
     if quad.sum() < 0.5 * book_w * book_h:   # 面积异常 → 拟合失败
         return None
     return quad
@@ -179,9 +213,10 @@ def _span_bool(content: np.ndarray, h: int, w: int) -> np.ndarray:
 
 def build_book_mask(img: Image.Image) -> Image.Image:
     """书主体轮廓 mask（在原图全幅上计算）：
-    四边形（上/左/右宽松保书页边、底边严格切投影）∩ 宽松跨度轮廓（角部不越界）。
+    每条边 = 拟合直线（横平竖直），仅端部真实缺角（书脊顶斜切等）跟随实际轮廓；
+    上/左/右用宽松阈值保书页物理边，底边用严格阈值切投影。
     封面内部的白色区域必然在四边形内部，永远实心不穿帮。
-    拟合失败回退严格跨度轮廓（原行为）。"""
+    拟合失败回退严格跨度轮廓。"""
     strict, loose = _masks(img)
     strict = _denoise(strict)
     loose = _denoise(loose)
@@ -189,8 +224,7 @@ def build_book_mask(img: Image.Image) -> Image.Image:
 
     quad = _fit_quad_mask(strict, loose, h, w)
     if quad is not None:
-        final = quad & _span_bool(loose, h, w)
-        return Image.fromarray((final.astype(np.uint8)) * 255)
+        return Image.fromarray((quad.astype(np.uint8)) * 255)
 
     final = _span_bool(strict, h, w)
     return Image.fromarray((final.astype(np.uint8)) * 255).filter(ImageFilter.MinFilter(3))
