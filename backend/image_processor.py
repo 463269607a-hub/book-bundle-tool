@@ -284,6 +284,118 @@ def build_book_mask(img: Image.Image) -> Image.Image:
     return Image.fromarray((final.astype(np.uint8)) * 255).filter(ImageFilter.MinFilter(3))
 
 
+def _find_perspective_coeffs(dst_size: tuple, src_quad: list) -> np.ndarray:
+    """输出矩形 (W,H) 四角 → 源图四边形四角（TL,TR,BR,BL）的透视系数。"""
+    W, H = dst_size
+    dst = [(0, 0), (W - 1, 0), (W - 1, H - 1), (0, H - 1)]
+    A, B = [], []
+    for (X, Y), (x, y) in zip(dst, src_quad):
+        A.append([X, Y, 1, 0, 0, 0, -x * X, -x * Y]); B.append(x)
+        A.append([0, 0, 0, X, Y, 1, -y * X, -y * Y]); B.append(y)
+    return np.linalg.solve(np.array(A, dtype=np.float64), np.array(B, dtype=np.float64))
+
+
+def rectify_book(img: Image.Image):
+    """把书透视矫正成横平竖直的矩形（根本解法）：
+    实体书是长方体，照片里就是一个四边形——拟合四条边直线，
+    每条边按实测白纸边厚度内收（白边整体切除），四线交点定四角，
+    透视变换到正矩形。输出即书本体矩形图：边就是水平线/垂直线，
+    物理上不可能出现白边、锯齿、台阶、斜边。拟合失败返回 None 走旧轮廓流程。"""
+    strict, loose, nw = _masks(img)
+    strict = _denoise(strict)
+    h, w = strict.shape
+
+    xs = np.where(strict.any(axis=0))[0]
+    ys = np.where(strict.any(axis=1))[0]
+    if len(xs) < 40 or len(ys) < 40:
+        return None
+    book_w, book_h = len(xs), len(ys)
+
+    def trim(idx):
+        k = max(2, int(len(idx) * 0.04))
+        return idx[k:-k]
+
+    xs_t, ys_t = trim(xs), trim(ys)
+    gate = max(5.0, min(book_w, book_h) * 0.02)
+
+    s_top, s_bot, s_left, s_right = _edge_profiles(strict, h, w)
+    l_top, _, l_left, l_right = _edge_profiles(loose, h, w)
+
+    def fit(idx, prof):
+        m, b, r = _robust_line(idx, prof[idx])
+        return (m, b) if r <= gate else None
+
+    def choose(s_prof, l_prof, idx, outward, tol):
+        """外沿优先宽松线（物理边），偏离严格线超容差退回严格线。"""
+        sf = fit(idx, s_prof)
+        if sf is None:
+            return None
+        lf = fit(idx, l_prof)
+        if lf is None:
+            return sf
+        mid = float(idx[len(idx) // 2])
+        d = ((sf[0] * mid + sf[1]) - (lf[0] * mid + lf[1])) * outward
+        return lf if -2 <= d <= tol else sf
+
+    top = choose(s_top, l_top, xs_t, +1, book_h * 0.08)
+    left = choose(s_left, l_left, ys_t, +1, book_w * 0.06)
+    right = choose(s_right, l_right, ys_t, -1, book_w * 0.06)
+    bot = fit(xs_t, s_bot)
+    if not all((top, left, right, bot)):
+        return None
+
+    # 每条边实测白纸边厚度（近白带中位数，标量），内收 = 厚度 + 3px 保险；
+    # 厚度上限防止把封面自身的浅色画面（如浅蓝天空）当白边切掉
+    rows_g = np.arange(h)[:, None]
+    cols_g = np.arange(w)[None, :]
+
+    def band(line_vals_full, cover_prof, dom, cap):
+        d = (cover_prof - line_vals_full)[dom]
+        return min(max(float(np.median(d)), 0.0), cap)
+
+    cap_v = max(8.0, book_h * 0.015)
+    cap_h = max(8.0, book_w * 0.015)
+
+    lv = top[0] * np.arange(w) + top[1]
+    cover = (~(nw | (rows_g < np.ceil(lv)[None, :]))).argmax(axis=0)
+    inset_top = 3.0 + band(lv, cover, xs_t, cap_v)
+
+    lv = left[0] * np.arange(h) + left[1]
+    cover = (~(nw | (cols_g < np.ceil(lv)[:, None]))).argmax(axis=1)
+    inset_left = 3.0 + band(lv, cover, ys_t, cap_h)
+
+    lv = right[0] * np.arange(h) + right[1]
+    cover = w - 1 - (~(nw | (cols_g > np.floor(lv)[:, None])))[:, ::-1].argmax(axis=1)
+    inset_right = 3.0 + band(-lv, -cover, ys_t, cap_h)
+
+    mt, bt = top[0], top[1] + inset_top
+    mb_, bb_ = bot[0], bot[1] - 4.0          # 底边切投影
+    ml, bl = left[0], left[1] + inset_left
+    mr, br = right[0], right[1] - inset_right
+
+    # 四线交点 = 四角（上/下边 y=m·x+b；左/右边 x=m·y+b）
+    def corner(m_h, b_h, m_v, b_v):
+        y = (m_h * b_v + b_h) / (1.0 - m_h * m_v)
+        x = m_v * y + b_v
+        return (float(np.clip(x, 0, w - 1)), float(np.clip(y, 0, h - 1)))
+
+    TL = corner(mt, bt, ml, bl)
+    TR = corner(mt, bt, mr, br)
+    BR = corner(mb_, bb_, mr, br)
+    BL = corner(mb_, bb_, ml, bl)
+
+    Wd = int(round((np.hypot(TR[0] - TL[0], TR[1] - TL[1]) +
+                    np.hypot(BR[0] - BL[0], BR[1] - BL[1])) / 2))
+    Hd = int(round((np.hypot(BL[0] - TL[0], BL[1] - TL[1]) +
+                    np.hypot(BR[0] - TR[0], BR[1] - TR[1])) / 2))
+    if Wd < 30 or Hd < 30:
+        return None
+
+    coeffs = _find_perspective_coeffs((Wd, Hd), [TL, TR, BR, BL])
+    return img.transform((Wd, Hd), Image.PERSPECTIVE, tuple(coeffs),
+                         resample=Image.BICUBIC)
+
+
 def draw_book_shadow(canvas: Image.Image, mask_r: Image.Image, px: int, py: int):
     """沿书的轮廓在其后方投一圈淡柔影（四周均匀，不偏移），只给画面层次感。
     书与书的分隔靠"书页物理边 + 硬直边 + 完全不透明"，
@@ -345,8 +457,12 @@ def process_row(book_images: list, n_books: int, debug: bool = False) -> Image.I
     books = []
     for img in book_images:
         img = flatten_white(img)
-        # 先在原图全幅上算 mask，再按 mask 外接框裁剪——
-        # 若先按颜色裁剪会把书页浅色边裁掉，mask 再准也保不住物理边
+        # 主路径：透视矫正成横平竖直的矩形（无白边/锯齿/斜边）
+        rect = rectify_book(img)
+        if rect is not None:
+            books.append((rect, Image.new('L', rect.size, 255)))
+            continue
+        # 回退：轮廓 mask 流程（拟合失败的非常规图）
         mask = build_book_mask(img)
         am = np.array(mask)
         rows = np.where(am.any(axis=1))[0]
