@@ -438,9 +438,25 @@ def rectify_book(img: Image.Image):
     if Wd < 30 or Hd < 30:
         return None
 
+    # 立体书的书脊面比封面短（3D透视：书脊顶更低/底更高），按整书一个四边形
+    # 量取时书脊上/下方会采到白底 → 白边、"削角"。变换前把书外沿上方/下方的
+    # 背景像素用该列书边自身颜色填充，短掉的部分由书脊颜色延伸补齐
+    arr = np.array(img)
+    t_prof = loose.argmax(axis=0)
+    b_prof = h - 1 - loose[::-1, :].argmax(axis=0)
+    has = loose.any(axis=0)
+    rows_gg = np.arange(h)[:, None]
+    cols_i = np.arange(w)
+    top_fill = arr[np.clip(t_prof + 3, 0, h - 1), cols_i]
+    bot_fill = arr[np.clip(b_prof - 3, 0, h - 1), cols_i]
+    m_top = (rows_gg < t_prof[None, :]) & has[None, :]
+    m_bot = (rows_gg > b_prof[None, :]) & has[None, :]
+    arr = np.where(m_top[:, :, None], top_fill[None, :, :], arr)
+    arr = np.where(m_bot[:, :, None], bot_fill[None, :, :], arr)
+
     coeffs = _find_perspective_coeffs((Wd, Hd), [TL, TR, BR, BL])
-    return img.transform((Wd, Hd), Image.PERSPECTIVE, tuple(coeffs),
-                         resample=Image.BICUBIC)
+    return Image.fromarray(arr.astype(np.uint8)).transform(
+        (Wd, Hd), Image.PERSPECTIVE, tuple(coeffs), resample=Image.BICUBIC)
 
 
 def draw_book_shadow(canvas: Image.Image, mask_r: Image.Image, px: int, py: int):
