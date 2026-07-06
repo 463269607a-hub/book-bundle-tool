@@ -24,7 +24,9 @@ def _masks(img: Image.Image) -> tuple:
     mn = arr.min(axis=2)
     sat = arr.max(axis=2) - mn
     strict = (mn < 170) | (sat > 28)
-    loose = (mn < 246) | (sat > 10)
+    # 实测（用户真实图 2.jpg）：书页纸边亮度可达 249~254，背景是精确的 255 纯白，
+    # loose 的背景判定必须收到"≥254 且无彩色"，否则最亮的纸边被当背景切掉 → 融合
+    loose = (mn < 254) | (sat > 8)
     return strict, loose
 
 
@@ -89,89 +91,100 @@ def _edge_profiles(content: np.ndarray, h: int, w: int) -> tuple:
     return top, bottom, left, right
 
 
+def _seg_boundary(idx: np.ndarray, prof: np.ndarray, tol: float, envelope: float) -> tuple:
+    """长方体的边 = 分段直线：先拟合主直线，小波动一律吸附到线上（横平竖直）；
+    与主线同向偏差超过 tol 且足够长的连续段（书脊顶、透视产生的第二条边、
+    切角/圆角）各自再拟合一条直线。返回 (idx 上的边界值, 对实际轮廓的中位残差)。"""
+    raw = prof[idx].astype(np.float64)
+    m, b, _ = _robust_line(idx, prof[idx])
+    line = m * idx + b
+    out = line.copy()
+    dev = raw - line
+    big = np.abs(dev) > tol
+    n = len(idx)
+    min_seg = max(8, int(n * 0.04))
+    i = 0
+    while i < n:
+        if not big[i]:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and big[j] and (dev[j] > 0) == (dev[i] > 0):
+            j += 1
+        if j - i >= min_seg:
+            sm, sb, _ = _robust_line(idx[i:j], prof[idx[i:j]])
+            seg = sm * idx[i:j] + sb
+            # 分段线不能离主线太远（防止把背景上的横向杂物当成边）
+            if np.max(np.abs(seg - line[i:j])) <= envelope:
+                out[i:j] = seg
+        i = j
+    resid = float(np.median(np.abs(raw - out)))
+    return out, resid
+
+
 def _fit_quad_mask(strict: np.ndarray, loose: np.ndarray, h: int, w: int):
-    """实体书是长方体，正面拍摄的轮廓就是四边形——四条边各拟合一条直线。
-    上/左/右边优先用宽松阈值的边界线（把书页浅色物理边保在书内，
-    叠压时它就是天然分界线）；底边用严格线内收 2px（书底常有投影，必须切，
-    而底边在版式里要么贴画布底、要么被前排书挡住，切一点不可见）。
-    每条宽松线都有保护：偏离严格线超出容差（背景不干净）就退回严格线。
-    轮廓不像四边形（残差大）返回 None。"""
+    """实体书是长方体，正面拍摄的轮廓 = 若干段直线围成的凸多边形（含书脊透视）。
+    四个方向各求一条"分段直线"边界：
+    上/左/右优先用宽松阈值轮廓（保住书页纸边——实体书的物理边缘、叠压时的
+    天然分界线）；底边用严格阈值内收 2px（书底投影必须切，且底边在版式中不可见）。
+    宽松线偏离严格线超容差（背景不干净）时该边退回严格轮廓。
+    分段拟合后残差仍大（轮廓不像块状实体）返回 None，回退跨度轮廓。"""
     xs = np.where(strict.any(axis=0))[0]
     ys = np.where(strict.any(axis=1))[0]
     if len(xs) < 40 or len(ys) < 40:
         return None
+    book_w, book_h = len(xs), len(ys)
 
     def trim(idx):
-        k = max(2, int(len(idx) * 0.04))   # 掐掉两端 4%，角部不参与拟合
+        k = max(2, int(len(idx) * 0.04))   # 主线比较时掐掉两端角部
         return idx[k:-k]
 
     xs_t, ys_t = trim(xs), trim(ys)
-    book_w, book_h = len(xs), len(ys)
-    max_resid = max(3.0, min(book_w, book_h) * 0.01)
 
     s_top, s_bot, s_left, s_right = _edge_profiles(strict, h, w)
     l_top, _, l_left, l_right = _edge_profiles(loose, h, w)
+    xs_l = np.where(loose.any(axis=0))[0]
+    ys_l = np.where(loose.any(axis=1))[0]
 
-    def fit(dx, dy):
-        m, b, resid = _robust_line(dx, dy)
-        return (m, b) if resid <= max_resid else None
-
-    top_s = fit(xs_t, s_top[xs_t])
-    bot_s = fit(xs_t, s_bot[xs_t])
-    left_s = fit(ys_t, s_left[ys_t])
-    right_s = fit(ys_t, s_right[ys_t])
-    if not all((top_s, bot_s, left_s, right_s)):
-        return None
-
-    def pick(strict_line, loose_prof, idx, outward_sign, tol):
-        """宽松线只允许比严格线向外 0~tol（书页边的合理厚度），
-        否则退回严格线。outward_sign=+1 向外为更小值(上/左)，-1 为更大值(下/右)。"""
-        lf = fit(idx, loose_prof[idx])
-        if lf is None:
-            return strict_line
+    def choose(s_prof, l_prof, idx, outward_sign, tol_pick, s_dom, l_dom):
+        """宽松轮廓只允许比严格轮廓向外 0~tol_pick（书页边的合理厚度），
+        否则退回严格轮廓。outward_sign=+1 向外为更小值(上/左)，-1 为更大值(下/右)。"""
+        ms, bs, _ = _robust_line(idx, s_prof[idx])
+        ml, bl, _ = _robust_line(idx, l_prof[idx])
         mid = float(idx[len(idx) // 2])
-        d = ((strict_line[0] * mid + strict_line[1]) -
-             (lf[0] * mid + lf[1])) * outward_sign
-        return lf if -2 <= d <= tol else strict_line
+        d = ((ms * mid + bs) - (ml * mid + bl)) * outward_sign
+        return (l_prof, l_dom) if -2 <= d <= tol_pick else (s_prof, s_dom)
 
-    top = pick(top_s, l_top, xs_t, +1, book_h * 0.08)
-    left = pick(left_s, l_left, ys_t, +1, book_w * 0.06)
-    right = pick(right_s, l_right, ys_t, -1, book_w * 0.06)
-    bot = (bot_s[0], bot_s[1] - 2)
-
-    # ── 每条边界 = 拟合直线（绝对平直，小波动一律吸附到线上），
-    #    仅在"从两端连续延伸、深度超过容差"的真实缺角处（书脊顶斜切、圆角）
-    #    跟随实际轮廓 —— 既不出现台阶/波浪，也不把白底三角圈进书内 ──
-    def bounded(line, raw, lo, hi, n, tol, direction, empty):
-        """direction=+1：上/左边界（缺角=raw 比线更大）；-1：下/右（raw 更小）。
-        返回长度 n 的逐列/逐行边界数组；有效范围外置 empty（使 mask 为空）。"""
-        vals = line[0] * np.arange(n) + line[1]
-        out = np.full(n, float(empty))
-        out[lo:hi + 1] = vals[lo:hi + 1]
-        dev = (raw.astype(np.float64) - vals) * direction > tol
-        i = lo
-        while i <= hi and dev[i]:
-            out[i] = raw[i]
-            i += 1
-        j = hi
-        while j >= lo and dev[j]:
-            out[j] = raw[j]
-            j -= 1
-        return out
+    top_prof, top_dom = choose(s_top, l_top, xs_t, +1, book_h * 0.08, xs, xs_l)
+    left_prof, left_dom = choose(s_left, l_left, ys_t, +1, book_w * 0.06, ys, ys_l)
+    right_prof, right_dom = choose(s_right, l_right, ys_t, -1, book_w * 0.06, ys, ys_l)
 
     tol_v = max(4.0, book_h * 0.012)
     tol_h = max(4.0, book_w * 0.012)
-    # 有效范围用宽松阈值的外延：书页纸边可能高于/宽于严格内容范围
-    # （顶边倾斜时纸边一端超出严格行范围，用严格范围会把纸边削平成台阶）
-    xs_l = np.where(loose.any(axis=0))[0]
-    ys_l = np.where(loose.any(axis=1))[0]
+    env_v = book_h * 0.15
+    env_h = book_w * 0.15
+    gate = max(4.0, min(book_w, book_h) * 0.015)
+
+    top_v, r1 = _seg_boundary(top_dom, top_prof, tol_v, env_v)
+    bot_v, r2 = _seg_boundary(xs, s_bot, tol_v, env_v)
+    left_v, r3 = _seg_boundary(left_dom, left_prof, tol_h, env_h)
+    right_v, r4 = _seg_boundary(right_dom, right_prof, tol_h, env_h)
+    if max(r1, r2, r3, r4) > gate:
+        return None
+
+    # 边界数组铺到全幅；有效范围用宽松外延（纸边可能超出严格范围），范围外置空
     x_lo, x_hi = int(xs_l[0]), int(xs_l[-1])
     y_lo, y_hi = int(ys_l[0]), int(ys_l[-1])
 
-    top_b = bounded(top, l_top, x_lo, x_hi, w, tol_v, +1, h + 1)
-    bot_b = bounded(bot, s_bot, x_lo, x_hi, w, tol_v, -1, -1)
-    left_b = bounded(left, l_left, y_lo, y_hi, h, tol_h, +1, w + 1)
-    right_b = bounded(right, l_right, y_lo, y_hi, h, tol_h, -1, -1)
+    def full_arr(dom, vals, n, lo, hi, empty):
+        a = np.full(n, float(empty))
+        a[lo:hi + 1] = np.interp(np.arange(lo, hi + 1), dom, vals)
+        return a
+
+    top_b = full_arr(top_dom, top_v, w, x_lo, x_hi, h + 1)
+    bot_b = full_arr(xs, bot_v - 2, w, x_lo, x_hi, -1)   # 底边内收2px切投影
+    left_b = full_arr(left_dom, left_v, h, y_lo, y_hi, w + 1)
+    right_b = full_arr(right_dom, right_v, h, y_lo, y_hi, -1)
 
     X = np.arange(w)[None, :]
     Y = np.arange(h)[:, None]
@@ -219,7 +232,8 @@ def build_book_mask(img: Image.Image) -> Image.Image:
     拟合失败回退严格跨度轮廓。"""
     strict, loose = _masks(img)
     strict = _denoise(strict)
-    loose = _denoise(loose)
+    # loose 不做开运算：纸边只有几像素厚、且内部混有近255的行，开运算会把它整条吃掉；
+    # 背景零星噪点交给直线拟合的中位数机制（噪点列被吸附回直线，不会外扩）
     h, w = strict.shape
 
     quad = _fit_quad_mask(strict, loose, h, w)
