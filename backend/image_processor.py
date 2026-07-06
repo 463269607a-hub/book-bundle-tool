@@ -27,7 +27,9 @@ def _masks(img: Image.Image) -> tuple:
     # 实测（用户真实图 2.jpg）：书页纸边亮度可达 249~254，背景是精确的 255 纯白，
     # loose 的背景判定必须收到"≥254 且无彩色"，否则最亮的纸边被当背景切掉 → 融合
     loose = (mn < 254) | (sat > 8)
-    return strict, loose
+    # 近白：书页纸边那种"发白无彩色"的像素（用于把白边整形成统一宽度）
+    nw = (mn >= 228) & (sat <= 14)
+    return strict, loose, nw
 
 
 def _denoise(content: np.ndarray) -> np.ndarray:
@@ -40,7 +42,7 @@ def _denoise(content: np.ndarray) -> np.ndarray:
 def crop_whitespace(img: Image.Image, shrink: int = 1) -> Image.Image:
     """按严格内容外接框裁白边（独立工具函数；主流程 process_row
     改为先算 mask 再按 mask 外接框裁，避免这里把书页浅色边裁掉）。"""
-    is_content, _ = _masks(img)
+    is_content, _, _ = _masks(img)
 
     # 每行/列内容像素占比 > 3% 才算"有书"，过滤掉稀疏的边缘投影
     row_frac = is_content.mean(axis=1)
@@ -98,11 +100,14 @@ def _seg_boundary(idx: np.ndarray, prof: np.ndarray, tol: float, envelope: float
     raw = prof[idx].astype(np.float64)
     m, b, _ = _robust_line(idx, prof[idx])
     line = m * idx + b
-    out = line.copy()
     dev = raw - line
     big = np.abs(dev) > tol
     n = len(idx)
     min_seg = max(8, int(n * 0.04))
+
+    # 找出各分段（含主线段），记录 (起, 止, 斜率, 截距)
+    pieces = []
+    main_start = 0
     i = 0
     while i < n:
         if not big[i]:
@@ -116,13 +121,39 @@ def _seg_boundary(idx: np.ndarray, prof: np.ndarray, tol: float, envelope: float
             seg = sm * idx[i:j] + sb
             # 分段线不能离主线太远（防止把背景上的横向杂物当成边）
             if np.max(np.abs(seg - line[i:j])) <= envelope:
-                out[i:j] = seg
+                if i > main_start:
+                    pieces.append([main_start, i, m, b])
+                pieces.append([i, j, sm, sb])
+                main_start = j
         i = j
+    if main_start < n:
+        pieces.append([main_start, n, m, b])
+
+    # 相邻两段直线延长到交点相接——长方体的角就是两条直线的交点，
+    # 中间不留空隙（空隙会露出白底）、也不跟随逐列噪声（保持横平竖直）
+    cuts = [float(idx[0])]
+    for k in range(len(pieces) - 1):
+        s1, e1, m1, b1 = pieces[k]
+        s2, e2, m2, b2 = pieces[k + 1]
+        cut = (float(idx[e1 - 1]) + float(idx[s2])) / 2.0
+        if abs(m1 - m2) > 1e-9:
+            xstar = (b2 - b1) / (m1 - m2)
+            if idx[s1] - 2 <= xstar <= idx[e2 - 1] + 2:
+                cut = xstar
+        cut = max(cut, cuts[-1])
+        cuts.append(cut)
+    cuts.append(float(idx[-1]) + 1)
+
+    out = line.copy()
+    for k, (s, e, mm, bb) in enumerate(pieces):
+        sel = (idx >= cuts[k]) & (idx < cuts[k + 1])
+        out[sel] = mm * idx[sel] + bb
+
     resid = float(np.median(np.abs(raw - out)))
     return out, resid
 
 
-def _fit_quad_mask(strict: np.ndarray, loose: np.ndarray, h: int, w: int):
+def _fit_quad_mask(strict: np.ndarray, loose: np.ndarray, nw: np.ndarray, h: int, w: int):
     """实体书是长方体，正面拍摄的轮廓 = 若干段直线围成的凸多边形（含书脊透视）。
     四个方向各求一条"分段直线"边界：
     上/左/右优先用宽松阈值轮廓（保住书页纸边——实体书的物理边缘、叠压时的
@@ -172,21 +203,47 @@ def _fit_quad_mask(strict: np.ndarray, loose: np.ndarray, h: int, w: int):
     if max(r1, r2, r3, r4) > gate:
         return None
 
-    # 白边控制（用户反馈"白边太多"）：
-    # ① 边界向内收 2px 削掉 JPEG 光晕，纸边只留薄薄一条
-    # ② 钳制到实际轮廓：任何一列/行边界都不得超出实际内容起点 1px 以上，
-    #    分段直线在书脊/封面拐角间留下的白色空隙由此消除
-    edge_inset = max(2.0, min(book_w, book_h) * 0.003)
+    # ── 白边整形：白纸边一律只留固定宽度，横平竖直、每本书一致 ──
+    # 找"封面起始线"（外轮廓向内第一处不是近白像素的位置，同样拟合成分段直线），
+    # 边界 = 封面线向外退 target 像素，且不越过外轮廓——
+    # 纸边厚的书削薄、薄的书保留原样，宽度统一，看起来就是干净的一条书边。
+    # 封面线离外轮廓过远（说明"白"是封面自己的浅色画面，如浅蓝天空）则不整形，
+    # 只削 1px 光晕——绝不切封面内容。
+    target_v = max(2.0, book_h * 0.004)
+    target_h = max(2.0, book_w * 0.004)
+    cap_v = max(10.0, book_h * 0.03)
+    cap_h = max(10.0, book_w * 0.03)
 
-    def finalize(dom, seg_vals, prof, sign):
-        raw = prof[dom].astype(np.float64)
-        if sign > 0:    # 上/左边界：向内 = 值增大
-            return np.maximum(seg_vals + edge_inset, raw - 1)
-        return np.minimum(seg_vals - edge_inset, raw + 1)
+    def trim_white(dom, outer_vals, cover_prof, tol, env, target, cap, sign):
+        cov_vals, res = _seg_boundary(dom, cover_prof, tol, env)
+        gap = (cov_vals - outer_vals) * sign
+        med_gap = float(np.median(gap))
+        if res > gate or med_gap < 0 or med_gap > cap:
+            return outer_vals + sign * 1.0   # 不整形，只削1px光晕
+        if sign > 0:   # 上/左
+            return np.maximum(outer_vals + 1.0, cov_vals - target)
+        return np.minimum(outer_vals - 1.0, cov_vals + target)
 
-    top_v = finalize(top_dom, top_v, top_prof, +1)
-    left_v = finalize(left_dom, left_v, left_prof, +1)
-    right_v = finalize(right_dom, right_v, right_prof, -1)
+    rows_g = np.arange(h)[:, None]
+    cols_g = np.arange(w)[None, :]
+
+    # 顶边：从外轮廓向下找第一个非近白像素
+    outer_full = np.full(w, float(h)); outer_full[top_dom] = top_v
+    blocked = nw | (rows_g < np.ceil(outer_full)[None, :])
+    cover_top = (~blocked).argmax(axis=0)
+    top_v = trim_white(top_dom, top_v, cover_top, tol_v, env_v, target_v, cap_v, +1)
+
+    # 左边：从外轮廓向右找第一个非近白像素
+    outer_full = np.full(h, float(w)); outer_full[left_dom] = left_v
+    blocked = nw | (cols_g < np.ceil(outer_full)[:, None])
+    cover_left = (~blocked).argmax(axis=1)
+    left_v = trim_white(left_dom, left_v, cover_left, tol_h, env_h, target_h, cap_h, +1)
+
+    # 右边：从外轮廓向左找第一个非近白像素
+    outer_full = np.full(h, -1.0); outer_full[right_dom] = right_v
+    blocked = nw | (cols_g > np.floor(outer_full)[:, None])
+    cover_right = w - 1 - (~blocked[:, ::-1]).argmax(axis=1)
+    right_v = trim_white(right_dom, right_v, cover_right, tol_h, env_h, target_h, cap_h, -1)
 
     # 边界数组铺到全幅；有效范围用宽松外延（纸边可能超出严格范围），范围外置空
     x_lo, x_hi = int(xs_l[0]), int(xs_l[-1])
@@ -246,13 +303,13 @@ def build_book_mask(img: Image.Image) -> Image.Image:
     上/左/右用宽松阈值保书页物理边，底边用严格阈值切投影。
     封面内部的白色区域必然在四边形内部，永远实心不穿帮。
     拟合失败回退严格跨度轮廓。"""
-    strict, loose = _masks(img)
+    strict, loose, nw = _masks(img)
     strict = _denoise(strict)
     # loose 不做开运算：纸边只有几像素厚、且内部混有近255的行，开运算会把它整条吃掉；
     # 背景零星噪点交给直线拟合的中位数机制（噪点列被吸附回直线，不会外扩）
     h, w = strict.shape
 
-    quad = _fit_quad_mask(strict, loose, h, w)
+    quad = _fit_quad_mask(strict, loose, nw, h, w)
     if quad is not None:
         return Image.fromarray((quad.astype(np.uint8)) * 255)
 
