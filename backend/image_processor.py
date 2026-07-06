@@ -390,15 +390,15 @@ def rectify_book(img: Image.Image):
 
     lv = top[0] * np.arange(w) + top[1]
     cover = (~(nw | (rows_g < np.ceil(lv)[None, :]))).argmax(axis=0)
-    inset_top = 3.0 + band(lv, cover, xs_t, cap_v)
+    inset_top = 5.0 + band(lv, cover, xs_t, cap_v)
 
     lv = left[0] * np.arange(h) + left[1]
     cover = (~(nw | (cols_g < np.ceil(lv)[:, None]))).argmax(axis=1)
-    inset_left = 3.0 + band(lv, cover, ys_t, cap_h)
+    inset_left = 5.0 + band(lv, cover, ys_t, cap_h)
 
     lv = right[0] * np.arange(h) + right[1]
     cover = w - 1 - (~(nw | (cols_g > np.floor(lv)[:, None])))[:, ::-1].argmax(axis=1)
-    inset_right = 3.0 + band(-lv, -cover, ys_t, cap_h)
+    inset_right = 5.0 + band(-lv, -cover, ys_t, cap_h)
 
     mt, bt = top[0], top[1] + inset_top
     mb_, bb_ = bot[0], bot[1] - 4.0          # 底边切投影
