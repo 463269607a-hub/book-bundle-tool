@@ -203,10 +203,11 @@ def _fit_quad_mask(strict: np.ndarray, loose: np.ndarray, nw: np.ndarray, h: int
     if max(r1, r2, r3, r4) > gate:
         return None
 
-    # 白边收薄：边界（一条干净折线）整体向内收固定量，削掉 JPEG 光晕、
-    # 白纸边只留薄薄一条。不做任何逐列比较/钳制/两线取大——
+    # 白边削除：边界（一条干净折线）整体向内收，把白纸边基本吃掉
+    # （实测纸边 2~9px，内收 ~1% 边长；吃进封面 1~3px 缩放后不可见）。
+    # 不做任何逐列比较/钳制/两线取大——
     # 两条近平行折线反复交叉会形成锯齿台阶（踩过的坑），边界必须是单一折线
-    edge_inset = max(2.0, min(book_w, book_h) * 0.004)
+    edge_inset = max(6.0, min(book_w, book_h) * 0.01)
     top_v = top_v + edge_inset
     left_v = left_v + edge_inset
     right_v = right_v - edge_inset
@@ -221,7 +222,7 @@ def _fit_quad_mask(strict: np.ndarray, loose: np.ndarray, nw: np.ndarray, h: int
         return a
 
     top_b = full_arr(top_dom, top_v, w, x_lo, x_hi, h + 1)
-    bot_b = full_arr(xs, bot_v - 2, w, x_lo, x_hi, -1)   # 底边内收2px切投影
+    bot_b = full_arr(xs, bot_v - 4, w, x_lo, x_hi, -1)   # 底边内收4px切投影和底部浅色角
     left_b = full_arr(left_dom, left_v, h, y_lo, y_hi, w + 1)
     right_b = full_arr(right_dom, right_v, h, y_lo, y_hi, -1)
 
