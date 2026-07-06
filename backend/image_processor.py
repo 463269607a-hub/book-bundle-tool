@@ -438,25 +438,17 @@ def rectify_book(img: Image.Image):
     if Wd < 30 or Hd < 30:
         return None
 
-    # 立体书的书脊面比封面短（3D透视：书脊顶更低/底更高），按整书一个四边形
-    # 量取时书脊上/下方会采到白底 → 白边、"削角"。变换前把书外沿上方/下方的
-    # 背景像素用该列书边自身颜色填充，短掉的部分由书脊颜色延伸补齐
-    arr = np.array(img)
-    t_prof = loose.argmax(axis=0)
-    b_prof = h - 1 - loose[::-1, :].argmax(axis=0)
-    has = loose.any(axis=0)
-    rows_gg = np.arange(h)[:, None]
-    cols_i = np.arange(w)
-    top_fill = arr[np.clip(t_prof + 3, 0, h - 1), cols_i]
-    bot_fill = arr[np.clip(b_prof - 3, 0, h - 1), cols_i]
-    m_top = (rows_gg < t_prof[None, :]) & has[None, :]
-    m_bot = (rows_gg > b_prof[None, :]) & has[None, :]
-    arr = np.where(m_top[:, :, None], top_fill[None, :, :], arr)
-    arr = np.where(m_bot[:, :, None], bot_fill[None, :, :], arr)
-
+    # 书是立方体不是矩形：书脊面比封面短（3D透视）是物理事实。
+    # 既不留白底（削角感）也不假延伸（长出假角）——把书的真实实心轮廓
+    # （宽松跨度 mask，含书脊短角的六边形）随同透视一起变换，
+    # 书脊上/下短掉的部分保持透明，叠压时露出后面的书，与实拍立体书一致
+    mask_src = Image.fromarray((_span_bool(loose, h, w).astype(np.uint8)) * 255)
     coeffs = _find_perspective_coeffs((Wd, Hd), [TL, TR, BR, BL])
-    return Image.fromarray(arr.astype(np.uint8)).transform(
-        (Wd, Hd), Image.PERSPECTIVE, tuple(coeffs), resample=Image.BICUBIC)
+    rect = img.transform((Wd, Hd), Image.PERSPECTIVE, tuple(coeffs),
+                         resample=Image.BICUBIC)
+    rect_mask = mask_src.transform((Wd, Hd), Image.PERSPECTIVE, tuple(coeffs),
+                                   resample=Image.BILINEAR)
+    return rect, rect_mask
 
 
 def draw_book_shadow(canvas: Image.Image, mask_r: Image.Image, px: int, py: int):
@@ -520,10 +512,10 @@ def process_row(book_images: list, n_books: int, debug: bool = False) -> Image.I
     books = []
     for img in book_images:
         img = flatten_white(img)
-        # 主路径：透视矫正成横平竖直的矩形（无白边/锯齿/斜边）
-        rect = rectify_book(img)
-        if rect is not None:
-            books.append((rect, Image.new('L', rect.size, 255)))
+        # 主路径：透视矫正（书图+真实轮廓mask 同步变换）
+        rectified = rectify_book(img)
+        if rectified is not None:
+            books.append(rectified)
             continue
         # 回退：轮廓 mask 流程（拟合失败的非常规图）
         mask = build_book_mask(img)
