@@ -326,23 +326,55 @@ def rectify_book(img: Image.Image):
         return (m, b) if r <= gate else None
 
     def choose(s_prof, l_prof, idx, outward, tol):
-        """外沿优先宽松线（物理边），偏离严格线超容差退回严格线。"""
+        """外沿优先宽松线（物理边），偏离严格线超容差退回严格线。返回 (线, 所用轮廓)。"""
         sf = fit(idx, s_prof)
         if sf is None:
-            return None
+            return None, None
         lf = fit(idx, l_prof)
         if lf is None:
-            return sf
+            return sf, s_prof
         mid = float(idx[len(idx) // 2])
         d = ((sf[0] * mid + sf[1]) - (lf[0] * mid + lf[1])) * outward
-        return lf if -2 <= d <= tol else sf
+        return (lf, l_prof) if -2 <= d <= tol else (sf, s_prof)
 
-    top = choose(s_top, l_top, xs_t, +1, book_h * 0.08)
-    left = choose(s_left, l_left, ys_t, +1, book_w * 0.06)
-    right = choose(s_right, l_right, ys_t, -1, book_w * 0.06)
+    top, top_prof = choose(s_top, l_top, xs_t, +1, book_h * 0.08)
+    left, left_prof = choose(s_left, l_left, ys_t, +1, book_w * 0.06)
+    right, right_prof = choose(s_right, l_right, ys_t, -1, book_w * 0.06)
     bot = fit(xs_t, s_bot)
     if not all((top, left, right, bot)):
         return None
+
+    def refine_no_white(line, prof, idx, sign, tol):
+        """立体书的边其实是两段直线（书脊段+封面段），单直线在交界处架空会漏白底楔子。
+        取最长内点连续段（主段=封面边）重拟合，再把线向内平移到
+        几乎处处(p98)不越过实际轮廓——白楔子结构性消除；
+        另一段（书脊顶）超出矩形的小角被裁掉，属书脊纯色区无内容损失。
+        sign=+1: 上/左边（向内=值增大）；-1: 右边。"""
+        vals = prof[idx].astype(np.float64)
+        L = line[0] * idx + line[1]
+        inlier = np.abs(vals - L) <= tol
+        best_s = best_e = 0
+        s = None
+        for k in range(len(idx) + 1):
+            if k < len(idx) and inlier[k]:
+                if s is None:
+                    s = k
+            else:
+                if s is not None and k - s > best_e - best_s:
+                    best_s, best_e = s, k
+                s = None
+        m, b = line
+        if best_e - best_s >= max(8, len(idx) // 4):
+            m, b, _ = _robust_line(idx[best_s:best_e], prof[idx[best_s:best_e]])
+        d = (vals - (m * idx + b)) * sign
+        shift = float(np.clip(np.percentile(d, 98), 0.0, max(4.0, tol)))
+        return (m, b + sign * shift)
+
+    tol_v = max(4.0, book_h * 0.012)
+    tol_h = max(4.0, book_w * 0.012)
+    top = refine_no_white(top, top_prof, xs_t, +1, tol_v)
+    left = refine_no_white(left, left_prof, ys_t, +1, tol_h)
+    right = refine_no_white(right, right_prof, ys_t, -1, tol_h)
 
     # 每条边实测白纸边厚度（近白带中位数，标量），内收 = 厚度 + 3px 保险；
     # 厚度上限防止把封面自身的浅色画面（如浅蓝天空）当白边切掉
