@@ -203,47 +203,13 @@ def _fit_quad_mask(strict: np.ndarray, loose: np.ndarray, nw: np.ndarray, h: int
     if max(r1, r2, r3, r4) > gate:
         return None
 
-    # ── 白边整形：白纸边一律只留固定宽度，横平竖直、每本书一致 ──
-    # 找"封面起始线"（外轮廓向内第一处不是近白像素的位置，同样拟合成分段直线），
-    # 边界 = 封面线向外退 target 像素，且不越过外轮廓——
-    # 纸边厚的书削薄、薄的书保留原样，宽度统一，看起来就是干净的一条书边。
-    # 封面线离外轮廓过远（说明"白"是封面自己的浅色画面，如浅蓝天空）则不整形，
-    # 只削 1px 光晕——绝不切封面内容。
-    target_v = max(2.0, book_h * 0.004)
-    target_h = max(2.0, book_w * 0.004)
-    cap_v = max(10.0, book_h * 0.03)
-    cap_h = max(10.0, book_w * 0.03)
-
-    def trim_white(dom, outer_vals, cover_prof, tol, env, target, cap, sign):
-        cov_vals, res = _seg_boundary(dom, cover_prof, tol, env)
-        gap = (cov_vals - outer_vals) * sign
-        med_gap = float(np.median(gap))
-        if res > gate or med_gap < 0 or med_gap > cap:
-            return outer_vals + sign * 1.0   # 不整形，只削1px光晕
-        if sign > 0:   # 上/左
-            return np.maximum(outer_vals + 1.0, cov_vals - target)
-        return np.minimum(outer_vals - 1.0, cov_vals + target)
-
-    rows_g = np.arange(h)[:, None]
-    cols_g = np.arange(w)[None, :]
-
-    # 顶边：从外轮廓向下找第一个非近白像素
-    outer_full = np.full(w, float(h)); outer_full[top_dom] = top_v
-    blocked = nw | (rows_g < np.ceil(outer_full)[None, :])
-    cover_top = (~blocked).argmax(axis=0)
-    top_v = trim_white(top_dom, top_v, cover_top, tol_v, env_v, target_v, cap_v, +1)
-
-    # 左边：从外轮廓向右找第一个非近白像素
-    outer_full = np.full(h, float(w)); outer_full[left_dom] = left_v
-    blocked = nw | (cols_g < np.ceil(outer_full)[:, None])
-    cover_left = (~blocked).argmax(axis=1)
-    left_v = trim_white(left_dom, left_v, cover_left, tol_h, env_h, target_h, cap_h, +1)
-
-    # 右边：从外轮廓向左找第一个非近白像素
-    outer_full = np.full(h, -1.0); outer_full[right_dom] = right_v
-    blocked = nw | (cols_g > np.floor(outer_full)[:, None])
-    cover_right = w - 1 - (~blocked[:, ::-1]).argmax(axis=1)
-    right_v = trim_white(right_dom, right_v, cover_right, tol_h, env_h, target_h, cap_h, -1)
+    # 白边收薄：边界（一条干净折线）整体向内收固定量，削掉 JPEG 光晕、
+    # 白纸边只留薄薄一条。不做任何逐列比较/钳制/两线取大——
+    # 两条近平行折线反复交叉会形成锯齿台阶（踩过的坑），边界必须是单一折线
+    edge_inset = max(2.0, min(book_w, book_h) * 0.004)
+    top_v = top_v + edge_inset
+    left_v = left_v + edge_inset
+    right_v = right_v - edge_inset
 
     # 边界数组铺到全幅；有效范围用宽松外延（纸边可能超出严格范围），范围外置空
     x_lo, x_hi = int(xs_l[0]), int(xs_l[-1])
