@@ -319,28 +319,43 @@ def rectify_book(img: Image.Image):
     gate = max(5.0, min(book_w, book_h) * 0.02)
 
     s_top, s_bot, s_left, s_right = _edge_profiles(strict, h, w)
-    l_top, _, l_left, l_right = _edge_profiles(loose, h, w)
+    l_top, l_bot, l_left, l_right = _edge_profiles(loose, h, w)
+
+    # 背景是否干净：宽松内容铺满全图说明背景不是纯白，不能信宽松线
+    xs_l = np.where(loose.any(axis=0))[0]
+    ys_l = np.where(loose.any(axis=1))[0]
+    bg_dirty = len(xs_l) > 0.99 * w and len(ys_l) > 0.99 * h
 
     def fit(idx, prof):
         m, b, r = _robust_line(idx, prof[idx])
         return (m, b) if r <= gate else None
 
-    def choose(s_prof, l_prof, idx, outward, tol):
-        """外沿优先宽松线（物理边），偏离严格线超容差退回严格线。返回 (线, 所用轮廓)。"""
+    def choose(s_prof, l_prof, idx, outward):
+        """外沿以宽松线（物理边）为准。白色封面会让严格线深入封面内部、
+        残差爆掉——绝不能要求严格线拟合成功，也不能按"离严格线太远"退回
+        严格线（会把白封面整个切掉，用户报过"书本体的白色都没了"）。
+        仅当背景不干净/宽松线拟合失败/宽松线异常跑到严格线内侧时用严格线。"""
+        lf = None if bg_dirty else fit(idx, l_prof)
         sf = fit(idx, s_prof)
-        if sf is None:
-            return None, None
-        lf = fit(idx, l_prof)
         if lf is None:
             return sf, s_prof
-        mid = float(idx[len(idx) // 2])
-        d = ((sf[0] * mid + sf[1]) - (lf[0] * mid + lf[1])) * outward
-        return (lf, l_prof) if -2 <= d <= tol else (sf, s_prof)
+        if sf is not None:
+            mid = float(idx[len(idx) // 2])
+            d = ((sf[0] * mid + sf[1]) - (lf[0] * mid + lf[1])) * outward
+            if d < -2:
+                return sf, s_prof
+        return lf, l_prof
 
-    top, top_prof = choose(s_top, l_top, xs_t, +1, book_h * 0.08)
-    left, left_prof = choose(s_left, l_left, ys_t, +1, book_w * 0.06)
-    right, right_prof = choose(s_right, l_right, ys_t, -1, book_w * 0.06)
+    top, top_prof = choose(s_top, l_top, xs_t, +1)
+    left, left_prof = choose(s_left, l_left, ys_t, +1)
+    right, right_prof = choose(s_right, l_right, ys_t, -1)
+    # 底边优先严格线（排除书底投影）；白封面书严格底线可能拟合失败，
+    # 退用宽松底线并加大内收（宽松底线可能落在投影下沿）
     bot = fit(xs_t, s_bot)
+    bot_inset = 4.0
+    if bot is None and not bg_dirty:
+        bot = fit(xs_t, l_bot)
+        bot_inset = 12.0
     if not all((top, left, right, bot)):
         return None
 
@@ -401,7 +416,7 @@ def rectify_book(img: Image.Image):
     inset_right = 5.0 + band(-lv, -cover, ys_t, cap_h)
 
     mt, bt = top[0], top[1] + inset_top
-    mb_, bb_ = bot[0], bot[1] - 4.0          # 底边切投影
+    mb_, bb_ = bot[0], bot[1] - bot_inset    # 底边切投影
     ml, bl = left[0], left[1] + inset_left
     mr, br = right[0], right[1] - inset_right
 
