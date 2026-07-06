@@ -172,6 +172,22 @@ def _fit_quad_mask(strict: np.ndarray, loose: np.ndarray, h: int, w: int):
     if max(r1, r2, r3, r4) > gate:
         return None
 
+    # 白边控制（用户反馈"白边太多"）：
+    # ① 边界向内收 2px 削掉 JPEG 光晕，纸边只留薄薄一条
+    # ② 钳制到实际轮廓：任何一列/行边界都不得超出实际内容起点 1px 以上，
+    #    分段直线在书脊/封面拐角间留下的白色空隙由此消除
+    edge_inset = max(2.0, min(book_w, book_h) * 0.003)
+
+    def finalize(dom, seg_vals, prof, sign):
+        raw = prof[dom].astype(np.float64)
+        if sign > 0:    # 上/左边界：向内 = 值增大
+            return np.maximum(seg_vals + edge_inset, raw - 1)
+        return np.minimum(seg_vals - edge_inset, raw + 1)
+
+    top_v = finalize(top_dom, top_v, top_prof, +1)
+    left_v = finalize(left_dom, left_v, left_prof, +1)
+    right_v = finalize(right_dom, right_v, right_prof, -1)
+
     # 边界数组铺到全幅；有效范围用宽松外延（纸边可能超出严格范围），范围外置空
     x_lo, x_hi = int(xs_l[0]), int(xs_l[-1])
     y_lo, y_hi = int(ys_l[0]), int(ys_l[-1])
