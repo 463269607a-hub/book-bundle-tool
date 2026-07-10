@@ -86,7 +86,7 @@ export default function UploadTable({ sessionId, onUploaded, onSessionExpired })
       <div className="upload-icon">📋</div>
       <div className="upload-label">上传匹配表格</div>
       <div className="upload-hint">拖拽或点击选择 CSV / Excel 文件</div>
-      <div className="upload-hint" style={{ marginTop: 4 }}>列名：组套名称, 子品1 ~ 子品5</div>
+      <div className="upload-hint" style={{ marginTop: 4 }}>第一列：组套名称（随意填写）；后面各列：子品编码（2~5个）；表头可有可无</div>
       {uploading && <div className="upload-count" style={{ background: '#fff3cd', color: '#856404' }}>上传中...</div>}
       {!uploading && count > 0 && (
         <div className="upload-count">{filename} — 共 {count} 行</div>

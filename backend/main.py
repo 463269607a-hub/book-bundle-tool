@@ -120,21 +120,19 @@ def validate_rows(session: dict) -> tuple:
     failed = []
 
     for row in table_rows:
-        codes = []
-        for i in range(1, 6):
-            c = row.get(f'code_{i}')
-            if c:
-                codes.append(c)
+        codes = row.get('codes')
+        if codes is None:
+            codes = [row[f'code_{i}'] for i in range(1, 6) if row.get(f'code_{i}')]
 
         # Check output_name
         if not row.get('output_name'):
-            failed.append({"row": row, "reason": "output_name为空"})
+            failed.append({"row": row, "reason": "组套名称为空"})
             continue
 
         # Check valid book count
         n = len(codes)
         if n < 2 or n > 5:
-            failed.append({"row": row, "reason": f"书本数量无效：{n}（需2-5本）"})
+            failed.append({"row": row, "reason": f"子品数量为 {n}，当前支持 2~5 本"})
             continue
 
         # Check duplicate codes within row
@@ -207,11 +205,9 @@ def generate(body: dict):
 
         try:
             for row in generatable:
-                codes = []
-                for i in range(1, 6):
-                    c = row.get(f'code_{i}')
-                    if c:
-                        codes.append(c)
+                codes = row.get('codes')
+                if codes is None:
+                    codes = [row[f'code_{i}'] for i in range(1, 6) if row.get(f'code_{i}')]
                 n = len(codes)
                 output_name = unique_name(row['output_name'])
 
